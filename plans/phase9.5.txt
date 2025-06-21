@@ -1,0 +1,254 @@
+### Phase 9.5 — Web **Status Board**
+
+*A single-page web app that users open in a browser to watch the pipeline live, drill into any phase, and chat with the Architect.  It consumes **one WebSocket** (already exposed by the UX-Agent in Phase 09) and renders everything client-side—so you deploy only static files.*
+
+---
+
+## 1  |  High-level architecture
+
+```
+┌────────────┐   https / CDN   ┌──────────────┐   ws:// :8088/ws   ┌───────────────┐
+│  Browser   │◄───────────────►│  StatusBoard │◄──────────────────►│  UX-Agent     │
+│  React SPA │   (vite build)  │  (static)    │   live pipeline    │  WebSocket GW │
+└────────────┘                 └──────────────┘                    └─────┬─────────┘
+                                                                         ▼
+                                                 Kafka topics (BREPORT, GTRES, ...)
+```
+
+*No back-end*; the SPA opens `ws://<host>:8088/ws`, receives JSON blobs the UX-Agent fan-outs, and stores them in a Redux (or Zustand) store.
+
+---
+
+## 2  |  Folder layout
+
+```
+ui/dashboard/
+  ├── index.html
+  ├── src/
+  │   ├── main.tsx              # entry
+  │   ├── app.tsx               # router shell
+  │   ├── store.ts              # Zustand store
+  │   ├── api/
+  │   │   └── socket.ts         # WS connect + recon
+  │   ├── pages/
+  │   │   ├── Home.tsx          # pipeline funnel
+  │   │   ├── PhaseDetail.tsx   # per-phase Gantt + tasks
+  │   │   ├── BuildLog.tsx      # artefact & log viewer
+  │   │   └── Chat.tsx          # Architect chat pane
+  │   └── components/
+  │       ├── SparkLine.tsx
+  │       ├── StatusBadge.tsx
+  │       └── DataTable.tsx
+  ├── vite.config.ts
+  └── tailwind.config.cjs       # styling
+```
+
+---
+
+## 3  |  Tech stack choices
+
+| Concern | Choice                                                | Reason                                |
+| ------- | ----------------------------------------------------- | ------------------------------------- |
+| Bundler | **Vite 5 + React 18**                                 | Fast HMR, TS out-of-box               |
+| Styling | **TailwindCSS** + DaisyUI                             | Utility-first, quick responsive cards |
+| State   | **Zustand**                                           | Tiny, minimal boilerplate             |
+| Charts  | **Apache ECharts** via `echarts-for-react`            | Real-time spark lines                 |
+| Routing | **react-router 6**                                    | `/#/phase/123` routes                 |
+| Auth    | (Phase 9.5: none). Future: GitHub OAuth implicit flow |                                       |
+| Testing | Vitest + React-Testing-Library                        | Matches Vite ecosystem                |
+
+---
+
+## 4  |  WebSocket message contract (from UX-Agent)
+
+The UX-Agent already forwards raw Kafka proto bytes. Add a *tiny* envelope in the UX-Agent WS fan-out if not already:
+
+```jsonc
+{
+  "topic": "build.report.out",
+  "payload": { /* BuildReport decoded to JSON */ }
+}
+```
+
+The Status Board doesn’t need Protobuf JS decoding—UX-Agent does it server-side.
+
+---
+
+## 5  |  Store schema (`store.ts`)
+
+```ts
+export interface PipelineState {
+  builds: Record<string, BuildReport>;      // commit_sha ➜ BuildReport
+  testSpecs: Record<string, TestSpec>;      // id ➜ ...
+  tasks: Record<string, CommitResult>;      // task_id ➜ CommitResult
+  phases: Record<string, PhasePlan>;        // phase_id ➜ PhasePlan
+  currentChat: ChatMessage[];
+  // actions
+  addMessage: (m: WsMsg) => void;
+  sendChat:  (txt: string) => void;
+}
+```
+
+---
+
+## 6  |  Socket helper (`api/socket.ts`)
+
+```ts
+import { io, Socket } from "socket.io-client"; // if you wrap WS in socket.io (optional)
+import { usePipelineStore } from "../store";
+
+export function openSocket() {
+  const url = import.meta.env.VITE_WS_URL ?? "ws://localhost:8088/ws";
+  const sock = new WebSocket(url);
+  const add = usePipelineStore.getState().addMessage;
+  sock.onmessage = (ev) => add(JSON.parse(ev.data));
+  sock.onclose = () => setTimeout(openSocket, 2000); // auto-reconnect
+}
+```
+
+Call `openSocket()` in `main.tsx`.
+
+---
+
+## 7  |  Key UI screens
+
+### 7.1  Home / Dashboard
+
+Cards:
+
+| Widget              | Data                                                   |
+| ------------------- | ------------------------------------------------------ |
+| **Pipeline Funnel** | Sparkline of message count per topic over last 10 min. |
+| **Current Phase**   | Phase ID + progress bar (% tasks complete).            |
+| **Build status**    | Last Build 1 & Build 2 status badges (green/red).      |
+| **LLM cost today**  | Sum of `llm_cost_usd_total` Prom metric.               |
+
+### 7.2  PhaseDetail (`/#/phase/:id`)
+
+* Gantt timeline: Task start/finish times, colour by SUCCESS/FAIL.
+* Table: Coding-Task → Commit SHA → Complexity → Duration.
+* Button “Jump to Build log”.
+
+### 7.3  BuildLog (`/#/build/:sha`)
+
+* Fetch artefact URL from BuildReport.
+* Show coverage %, failing tests table collapsible.
+* Download artefact button.
+
+### 7.4  Chat
+
+Right sidebar slide-over:
+
+```
+User: "Add retries to API client"
+Architect: "PhasePlan p23 created (goal: add retry) ..."
+      ...
+```
+
+Input box posts `UXPROMPT` message via socket (`socket.send(txt)`).
+
+---
+
+## 8  |  Vite build & deployment
+
+Add **`vite.config.ts`**
+
+```ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+export default defineConfig({
+  plugins: [react()],
+  base: "/dashboard/",      // served under cluster Ingress
+  build: { outDir: "dist" },
+});
+```
+
+Build command in CI:
+
+```bash
+cd ui/dashboard
+npm ci
+npm run build
+```
+
+Artifact `/dist/` delivered by:
+
+* Option A: **Nginx Deployment** with ConfigMap volume of built files.
+* Option B: **GitHub Pages** for dev; Ingress path `/dashboard/` proxies raw files.
+* Option C (**recommended**): Host files in **Grafana** as a static panel → easy SSO reuse.
+
+---
+
+## 9  |  Auth approach (MVP)
+
+* Public read-only board; chat requires a **shared token** (`?chat=secret`) checked client-side.
+* Future: GitHub OAuth; tokens forwarded to UX-Agent header that tags `user_id`.
+
+---
+
+## 10  |  Metrics & tracing
+
+Add browser OTel exporter (optional) to trace WS latency:
+
+```ts
+import { WebTracerProvider } from "@opentelemetry/sdk-trace-web"
+// config exporter to OTLP/HTTP endpoint
+```
+
+Not critical for MVP.
+
+---
+
+## 11  |  CI step
+
+Add job `build-dashboard`:
+
+```yaml
+- name: Build Status Board
+  working-directory: ui/dashboard
+  run: |
+    npm ci
+    npm run build
+- uses: actions/upload-artifact@v4
+  with: {path: ui/dashboard/dist, name: status-board}
+```
+
+Deployment workflow pulls artifact, builds Nginx “static” image and pushes to registry `status-board:sha`.
+
+---
+
+## 12  |  Helm chart (`charts/status-board/values.yaml`)
+
+```yaml
+image:
+  repository: ghcr.io/your-org/status-board
+  tag: "latest"      # set by CI
+service:
+  type: ClusterIP
+  port: 80
+ingress:
+  enabled: true
+  host: board.example.com
+env:
+  VITE_WS_URL: "wss://board.example.com/ws"
+```
+
+---
+
+## 13  |  Commit & tag
+
+```bash
+mkdir -p ui/dashboard
+# scaffolding files as above
+git add ui/dashboard charts/status-board
+git commit -m "phase09.5: real-time Status Board SPA with WebSocket feed"
+git push origin main
+git tag phase-09.5-complete
+git push origin phase-09.5-complete
+```
+
+---
+
+### Phase 9.5 complete
+
+*Users now open **[https://board.your-domain.com/](https://board.your-domain.com/)** to see a live funnel, per-phase timelines, build/test results, and a chat panel that pipes straight to the Architect.  The board talks only to the UX-Agent WebSocket—no extra back-end—and you deploy it as a static site.*

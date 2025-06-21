@@ -1,0 +1,142 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: sr
+      POSTGRES_PASSWORD: srpass
+      POSTGRES_DB: symbol_registry
+    ports:
+      - "5432:5432"
+
+  srm:
+    build:
+      context: .
+      dockerfile: ./apps/symbol_registry/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sr:srpass@postgres/symbol_registry
+    depends_on:
+      - postgres
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+
+  git_adapter:
+    build:
+      context: .
+      dockerfile: ./apps/git_adapter/Dockerfile
+    environment:
+      GIT_CACHE: /git-cache
+    volumes:
+      - git-cache:/git-cache
+    ports:
+      - "8200:8200"
+      - "8300:8300"
+    deploy:
+      replicas: 1
+
+  qdrant:
+    image: qdrant/qdrant:v1.9.0
+    ports: ["6333:6333"]
+    volumes: ["qdrant_data:/qdrant/storage"]
+
+  rag_service:
+    build:
+      context: .
+      dockerfile: ./apps/rag_service/Dockerfile
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      RAG_SQLITE_PATH: /rag/bm25.db
+    volumes: ["./.cache/rag:/rag"]
+    depends_on: [qdrant]
+    ports:
+      - "8000:8000"   # REST
+      - "9100:9100"   # gRPC
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.7.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.0
+    depends_on: [zookeeper]
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: ./apps/orchestrator/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+    depends_on: [kafka]
+
+  request_planner:
+    build:
+      context: .
+      dockerfile: ./apps/agents/request_planner/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      OPENAI_API_KEY: "sk-dummy"     # will be overridden in prod
+    depends_on: [kafka, orchestrator, srm, rag_service]
+
+  code_planner:
+    build:
+      context: .
+      dockerfile: ./apps/agents/code_planner/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+    depends_on: [kafka, orchestrator, rag_service]
+
+  git_cache:
+    build:
+      context: .
+      dockerfile: ./apps/git_cache/Dockerfile
+    environment:
+      REPO_URL: "https://github.com/your-org/self-healing-code"
+      METRICS_PORT: "9901"
+    volumes:
+      - git-cache:/git-cache
+    ports:
+      - "9901:9901"  # Metrics
+
+  coding_agent:
+    build:
+      context: .
+      dockerfile: ./apps/agents/coding_agent/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      OPENAI_API_KEY: "sk-dummy"
+      REMOTE_REPO: "https://github.com/your-org/self-healing-code"
+      MOCK_LLM: "1"  # Enable mock mode for testing
+      GIT_CACHE_REF: "/git-cache/7b96eefb9e2a59f3e628.git"  # SHA1 of repo URL
+    depends_on: [kafka, orchestrator, rag_service, srm, git_cache]
+    volumes:
+      - git-cache:/git-cache:ro  # Read-only mount
+    deploy:
+      replicas: 3  # auto-parallel
+
+  ci_runner:
+    build:
+      context: .
+      dockerfile: ./apps/ci_runner/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      REMOTE_REPO: "https://github.com/your-org/self-healing-code"
+      PYTEST_MARK: "fast"
+    volumes:
+      - ./artefacts:/artefacts
+      - pip-cache:/pipcache
+    depends_on: [kafka, orchestrator]
+    # ports:
+    #   - "9700:9700"  # Metrics - commented out due to replicas
+    deploy:
+      replicas: 3
+
+volumes:
+  git-cache:
+  qdrant_data:
+  pip-cache:

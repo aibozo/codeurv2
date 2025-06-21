@@ -1,0 +1,404 @@
+### Phase 01 — Symbol-Registry Micro-Service (SRM)
+
+*Goal: deliver a running HTTP + gRPC service, an async Python client, automated tests, and local-dev containers.*
+
+---
+
+## 0  |  Prerequisites
+
+| Tool                                      | Min ver | Notes                                                               |
+| ----------------------------------------- | ------- | ------------------------------------------------------------------- |
+| `protoc`                                  | 3.24    | Install via `brew install protobuf`, `choco install protoc` or apt. |
+| `poetry`                                  | 1.8     | Already boot-strapped in Phase 00.                                  |
+| Postgres                                  | 16      | Use Docker image.                                                   |
+| **Ports:** 8080 (REST), 9090 (gRPC) free. |         |                                                                     |
+
+---
+
+## 1  |  Create proto definition
+
+`proto/symbol.proto`
+
+```proto
+syntax = "proto3";
+
+package srm;
+
+message ReserveRequest {
+  string repo       = 1;
+  string branch     = 2;
+  string fq_name    = 3;
+  string kind       = 4;
+  string file_path  = 5;
+  string plan_id    = 6;
+  int32  ttl_sec    = 7;
+}
+
+message ReserveReply {
+  int64  lease_id   = 1;
+  string status     = 2;   // "reserved"
+  string expires_at = 3;
+}
+
+message ClaimRequest  { int64 lease_id = 1; string commit_sha = 2; }
+message ClaimReply    { string status  = 1; }
+message LookupRequest { string repo = 1; string branch = 2; string fq_name = 3; }
+message LookupReply   {
+  string status     = 1;
+  string file_path  = 2;
+  string commit_sha = 3;
+}
+
+service SymbolRegistry {
+  rpc Reserve(ReserveRequest) returns (ReserveReply);
+  rpc Claim  (ClaimRequest)   returns (ClaimReply);
+  rpc Lookup (LookupRequest)  returns (LookupReply);
+}
+```
+
+Generate stubs:
+
+```bash
+python -m pip install grpcio-tools==1.65
+python -m grpc_tools.protoc -I proto --python_out=apps --grpc_python_out=apps proto/symbol.proto
+```
+
+---
+
+## 2  |  Add dependencies
+
+`pyproject.toml`
+
+```toml
+[tool.poetry.dependencies]
+fastapi      = "^0.112"
+uvicorn      = {extras = ["standard"], version = "^0.30"}
+asyncpg      = "^0.30"
+sqlmodel     = "^0.0.16"
+grpclib      = "^0.4.7"
+pydantic     = "^2.7"
+alembic      = "^1.13"
+prometheus-client = "^0.20"
+
+[tool.poetry.group.dev.dependencies]
+pytest-asyncio = "^0.23"
+httpx         = "^0.27"
+pytest        = "^8.2"
+```
+
+```bash
+poetry install
+```
+
+---
+
+## 3  |  Database model & migrations
+
+`apps/symbol_registry/models.py`
+
+```python
+from datetime import datetime, timedelta
+from sqlmodel import Field, SQLModel
+
+class Symbol(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    repo: str
+    branch: str
+    fq_name: str
+    kind: str
+    file_path: str
+    status: str = "reserved"   # reserved | active | deprecated
+    plan_id: str | None = None
+    reserved_until: datetime | None = None
+    commit_sha: str | None = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+```
+
+Create migration env:
+
+```bash
+poetry run alembic init infra/alembic
+```
+
+Edit `alembic.ini` DSN:
+
+```
+sqlalchemy.url = postgresql+asyncpg://sr:srpass@localhost:5432/symbol_registry
+```
+
+Auto-generate first migration:
+
+```bash
+poetry run alembic revision --autogenerate -m "create symbols table"
+poetry run alembic upgrade head
+```
+
+*(Phase 00 repo has no DB. For dev we’ll spin Postgres in Docker in step 8.)*
+
+---
+
+## 4  |  Service implementation
+
+`apps/symbol_registry/db.py`
+
+```python
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlmodel import select
+from .models import Symbol, SQLModel
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from os import getenv
+DATABASE_URL = getenv("DATABASE_URL")
+
+engine = create_async_engine(DATABASE_URL, isolation_level="SERIALIZABLE")
+async_session = asynccontextmanager(lambda: AsyncSession(engine))
+
+async def reserve(data):
+    async with async_session() as session:
+        expire = datetime.utcnow() + timedelta(seconds=data.ttl_sec)
+        sym = Symbol(**data.model_dump(), reserved_until=expire)
+        session.add(sym)
+        try:
+            await session.commit()
+            await session.refresh(sym)
+        except Exception:
+            await session.rollback()
+            raise
+        return sym
+# ... claim(), lookup() similar
+```
+
+`apps/symbol_registry/api.py`
+
+```python
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from .db import reserve, claim, lookup
+
+app = FastAPI(title="Symbol Registry")
+
+class ReserveBody(BaseModel):
+    repo: str; branch: str; fq_name: str; kind: str
+    file_path: str; plan_id: str; ttl_sec: int = 600
+
+@app.post("/reserve")
+async def http_reserve(body: ReserveBody):
+    try:
+        rec = await reserve(body)
+    except Exception:
+        raise HTTPException(409, "symbol already exists")
+    return {"lease_id": rec.id,
+            "status": rec.status,
+            "expires_at": rec.reserved_until.isoformat()}
+# plus /claim, /lookup, /release, /extend …
+```
+
+`apps/symbol_registry/grpc_server.py`
+
+```python
+import grpclib
+from grpclib.server import Server
+from grpclib.utils import graceful_exit
+from . import symbol_pb2, symbol_grpc
+from .db import reserve, claim, lookup
+
+class SRM(symbol_grpc.SymbolRegistryBase):
+    async def Reserve(self, stream):
+        req = await stream.recv_message()
+        rec = await reserve(req)
+        await stream.send_message(symbol_pb2.ReserveReply(
+            lease_id=rec.id,
+            status=rec.status,
+            expires_at=rec.reserved_until.isoformat()
+        ))
+# … Claim(), Lookup()
+
+async def serve():
+    server = Server([SRM()])
+    with graceful_exit([server]):
+        await server.start(host="0.0.0.0", port=9090)
+        await server.wait_closed()
+```
+
+`apps/symbol_registry/main.py`
+
+```python
+import asyncio, uvicorn
+from .api import app
+from .grpc_server import serve
+
+async def start():
+    asyncio.create_task(serve())
+    uvicorn.run(app, host="0.0.0.0", port=8080)
+
+if __name__ == "__main__":
+    asyncio.run(start())
+```
+
+---
+
+## 5  |  Async client
+
+`clients/srm_client.py`
+
+```python
+import grpclib
+from grpclib.client import Channel
+from apps.symbol_registry import symbol_pb2, symbol_grpc
+
+class SRMClient:
+    def __init__(self, target="localhost", port=9090):
+        self._channel = Channel(target, port)
+
+    async def reserve(self, **kw):
+        stub = symbol_grpc.SymbolRegistryStub(self._channel)
+        reply = await stub.Reserve(symbol_pb2.ReserveRequest(**kw))
+        return reply
+    # claim(), lookup() …
+    async def __aexit__(self, *exc):
+        self._channel.close()
+```
+
+---
+
+## 6  |  Unit & API tests
+
+`apps/symbol_registry/tests/test_api.py`
+
+```python
+import asyncio, pytest, httpx, os, time
+from sqlalchemy import text
+from apps.symbol_registry.models import SQLModel
+from apps.symbol_registry.db import engine
+
+@pytest.fixture(scope="session", autouse=True)
+async def prepare_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+    yield
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+
+@pytest.mark.asyncio
+async def test_reserve_then_lookup():
+    async with httpx.AsyncClient(base_url="http://localhost:8080") as c:
+        r = await c.post("/reserve", json={
+            "repo":"demo","branch":"main","fq_name":"demo.func",
+            "kind":"function","file_path":"demo.py","plan_id":"P1"})
+        assert r.status_code == 200
+        lid = r.json()["lease_id"]
+        lk = await c.get("/lookup",
+                         params={"repo":"demo","branch":"main","fq_name":"demo.func"})
+        assert lk.json()["status"] == "reserved"
+```
+
+Add to CI matrix later.
+
+---
+
+## 7  |  Docker & Compose
+
+`apps/symbol_registry/Dockerfile`
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY pyproject.toml poetry.lock* /app/
+RUN pip install --no-cache-dir poetry && poetry export -f requirements.txt --without-hashes | pip install -r /dev/stdin
+COPY apps/symbol_registry /app/apps/symbol_registry
+CMD ["python", "-m", "apps.symbol_registry.main"]
+```
+
+`docker-compose.yml` (root):
+
+```yaml
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16
+    environment: {POSTGRES_USER: sr, POSTGRES_PASSWORD: srpass, POSTGRES_DB: symbol_registry}
+    ports: ["5432:5432"]
+
+  srm:
+    build: ./apps/symbol_registry
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sr:srpass@postgres/symbol_registry
+    depends_on: [postgres]
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+```
+
+```bash
+docker compose up --build
+```
+
+Smoke-test:
+
+```bash
+curl -X POST localhost:8080/reserve \
+  -H "Content-Type: application/json" \
+  -d '{"repo":"demo","branch":"main","fq_name":"demo.func","kind":"function","file_path":"demo.py","plan_id":"P1"}'
+```
+
+Expect JSON with `status:"reserved"`.
+
+---
+
+## 8  |  Prometheus metrics
+
+Append to `api.py`:
+
+```python
+from prometheus_client import Counter, Histogram, make_asgi_app
+REQUESTS = Counter("srm_reserve_total","reserve calls",["status"])
+LATENCY = Histogram("srm_lookup_latency_ms","ms","repo")
+app.mount("/metrics", make_asgi_app())
+```
+
+---
+
+## 9  |  Update pre-commit & CI
+
+`ruff` and `black` already run; ensure test job runs DB:
+
+`.github/workflows/ci.yml` (add)
+
+```yaml
+services:
+  postgres:
+    image: postgres:16
+    env:
+      POSTGRES_USER: sr
+      POSTGRES_PASSWORD: srpass
+      POSTGRES_DB: symbol_registry
+    ports: ["5432:5432"]
+    options: >-
+      --health-cmd pg_isready
+      --health-interval 10s
+      --health-timeout 5s
+      --health-retries 5
+steps:
+  - run: poetry run pytest apps/symbol_registry/tests -q
+```
+
+---
+
+## 10  |  Commit & tag
+
+```bash
+git add proto apps/symbol_registry clients docker-compose.yml
+git commit -m "phase01: implement Symbol-Registry micro-service"
+git push origin main
+git tag phase-01-complete
+git push origin phase-01-complete
+```
+
+---
+
+### Phase 01 completed
+
+*SRM service is live, client library published, tests green.*
+Proceed to **Phase 02 – RAG Service Skeleton**.

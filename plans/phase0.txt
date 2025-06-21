@@ -1,0 +1,193 @@
+### Phase 00 “Bootstrap” — Step-by-step implementation guide
+
+*Goal: scaffold a **clean, runnable mono-repo** that every later phase can extend without churn.*
+
+---
+
+## 0  |  Prerequisites
+
+| Tool           | Minimum version | Install check          |
+| -------------- | --------------- | ---------------------- |
+| `git`          | 2.40            | `git --version`        |
+| `python`       | 3.11            | `python -V`            |
+| `poetry`       | 1.8             | `poetry -V`            |
+| `pre-commit`   | 3.7             | `pre-commit --version` |
+| GitHub account | —               | ssh keys added         |
+
+> **Recommended shell**: Bash/Zsh on macOS / Linux; Windows users → WSL2.
+
+---
+
+## 1  |  Create the empty repo
+
+```bash
+gh repo create self-healing-code --public --clone
+cd self-healing-code
+git switch -c main
+```
+
+Add a **standard Python `.gitignore`:**
+
+```bash
+curl -o .gitignore https://raw.githubusercontent.com/github/gitignore/main/Python.gitignore
+```
+
+---
+
+## 2  |  Lay down the directory skeleton
+
+```bash
+mkdir -p \
+  apps/orchestrator \
+  apps/symbol_registry \
+  apps/rag_service \
+  apps/agents/{architect,ux_agent,request_planner,code_planner,coding_agent,test_planner,test_builder,verifier} \
+  apps/ci_runner \
+  charts \
+  proto \
+  docs/phase_plans \
+  infra \
+  scripts \
+  ui/dashboard
+touch apps/__init__.py
+```
+
+---
+
+## 3  |  Add `pyproject.toml`
+
+`pyproject.toml` (minimal until Phase 01):
+
+```toml
+[tool.poetry]
+name = "self-healing-code"
+version = "0.0.0"
+description = "Agent-based, self-healing coding platform"
+authors = ["You <you@example.com>"]
+packages = [{ include = "apps" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+
+[tool.poetry.group.dev.dependencies]
+pre-commit = "^3.7"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+```
+
+```bash
+poetry install
+```
+
+---
+
+## 4  |  Bootstrap Pre-commit
+
+`.pre-commit-config.yaml`
+
+```yaml
+repos:
+  - repo: https://github.com/psf/black
+    rev: 24.4.2
+    hooks: [ id: black ]
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.4
+    hooks: [ id: ruff ]
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-added-large-files
+      - id: end-of-file-fixer
+```
+
+```bash
+pre-commit install
+pre-commit run --all-files
+```
+
+---
+
+## 5  |  Add a README
+
+`README.md`
+
+```markdown
+# Self-Healing Coding Platform
+
+> Phase 00 bootstrap commit
+
+This repo will grow—phase-by-phase—into an autonomous agentic
+coding environment that plans, patches, tests, and heals itself.
+```
+
+---
+
+## 6  |  Optional helper scripts
+
+`scripts/dev_start.sh`
+
+```bash
+#!/usr/bin/env bash
+poetry shell
+echo "Activated virtualenv. Happy hacking!"
+```
+
+Make executable: `chmod +x scripts/dev_start.sh`
+
+---
+
+## 7  |  Initial commit & push
+
+```bash
+git add .
+git commit -m "phase00: repo bootstrap, skeleton, tooling"
+git push -u origin main
+```
+
+---
+
+## 8  |  (Optionally) seed CI stub
+
+`.github/workflows/ci.yml`
+
+```yaml
+name: Lint & Unit Test
+on: [push, pull_request]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - uses: abatilo/actions-poetry@v3
+      - run: poetry install
+      - run: poetry run ruff check .
+      - run: poetry run black --check .
+```
+
+Commit & push again (`git add .github && git commit -m "phase00: ci stub"`).
+
+---
+
+## 9  |  Verification checklist
+
+* [x] `poetry run python -c "print('Python good!')"`
+* [x] `git ls-files` shows skeleton folders.
+* [x] `pre-commit run --all-files` passes.
+* [x] GitHub Actions green.
+
+---
+
+## 10  |  Phase 00 complete
+
+Tag the repo:
+
+```bash
+git tag phase-00-complete
+git push origin phase-00-complete
+```
+
+You now have a **clean, tool-primed repo** ready for Phase 01 (Symbol-Registry micro-service).

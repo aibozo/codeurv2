@@ -1,0 +1,23 @@
+syntax = "proto3";
+package git;
+
+message Repo { string url = 1; }
+
+message CheckoutRequest  { Repo repo = 1; string ref = 2; } // branch, tag, or sha
+message CheckoutReply    { string workdir = 1; string commit_sha = 2; }
+
+message ReadFileRequest  { Repo repo = 1; string ref = 2; string path = 3; }
+message ReadFileReply    { bytes content = 1; }
+
+message DiffRequest      { Repo repo = 1; string base = 2; string head = 3; }
+message DiffReply        { string unified_diff = 1; }
+
+message BlameRequest     { Repo repo = 1; string ref = 2; string path = 3; }
+message BlameReply       { repeated string commits = 1; }
+
+service GitAdapter {
+  rpc Checkout (CheckoutRequest) returns (CheckoutReply);
+  rpc ReadFile (ReadFileRequest) returns (ReadFileReply);
+  rpc Diff    (DiffRequest)      returns (DiffReply);
+  rpc Blame   (BlameRequest)     returns (BlameReply);
+}

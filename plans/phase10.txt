@@ -1,0 +1,298 @@
+### Phase 10 — Observability, Cost Tracking & Autoscaling
+
+*Goal: ship a **production-grade operations layer** so every micro-service is observable, cost-controlled, and able to scale automatically.*
+
+---
+
+## 0  |  Stack Components & Target Versions
+
+| Component               | Version | Purpose                             |
+| ----------------------- | ------- | ----------------------------------- |
+| Prometheus Operator     | 0.73 .x | Metrics scraping + alertmanager     |
+| Grafana                 | 10.4 .x | Dashboards & alerts                 |
+| kube-state-metrics      | 4.5 .x  | Cluster-level metrics               |
+| OpenTelemetry Collector | 0.103   | Trace fan-out → Prometheus + Loki   |
+| Loki + Promtail         | 3.0     | Log aggregation                     |
+| KEDA                    | 2.13    | Event-driven HPA (Kafka lag scaler) |
+| Goldilocks              | 4.x     | CPU/Memory rightsizing suggestions  |
+| Kubecost (optional)     | 2.3     | Cost allocation                     |
+
+All installed via **Helm** charts in `charts/`.
+
+---
+
+## 1  |  Helm/Kustomize Directory Layout
+
+```
+charts/
+  monitoring/
+    prometheus-operator/  (Helm dependency)
+    grafana/              (Helm dependency)
+  tracing/
+    opentelemetry-collector/
+  logging/
+    loki/
+    promtail/
+  autoscaling/
+    keda/
+    hpas/                 # bespoke HPAs
+  cost/
+    kubecost/
+```
+
+`helmfile.yaml` at root orchestrates them for dev / staging / prod.
+
+---
+
+## 2  |  Prometheus Scrape & ServiceMonitors
+
+### 2.1  Add labels in each Deployment (example)
+
+```yaml
+metadata:
+  labels:
+    app.kubernetes.io/name: coding-agent
+    scrape: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        prometheus.io/port: "9600"
+        prometheus.io/scrape: "true"
+```
+
+### 2.2  ServiceMonitor (monitoring/srm-servicemonitor.yaml)
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: srm
+  labels: {release: prometheus}
+spec:
+  selector:
+    matchLabels: {app.kubernetes.io/name: symbol-registry}
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+```
+
+*(Repeat for every agent/runner service.)*
+
+---
+
+## 3  |  Dashboards
+
+### 3.1  Folder structure
+
+```
+charts/monitoring/grafana-dashboards/
+  agents-overview.json
+  kafka-lag.json
+  cost-summary.json
+```
+
+Dashboards include:
+
+* **Agents Overview** — successes/failures per agent, p95 latency.
+* **Pipeline Funnel** — count of messages per Kafka topic → drop-off visual.
+* **Build/CI Heatmap** — build duration vs commit time.
+* **Autoscale Status** — replica counts & KEDA scaler metrics.
+* **Cost Summary** — daily \$ by namespace (Kubecost API).
+
+Grafana dashboards are loaded via ConfigMap with `grafana.ini` `dashboardsProvider`.
+
+---
+
+## 4  |  Tracing
+
+### 4.1  OpenTelemetry Collector Config (`tracing/otelcol/values.yaml`)
+
+```yaml
+mode: deployment
+config:
+  receivers:
+    otlp: {protocols: {grpc: {}}}
+  exporters:
+    logging: {}
+    prometheus:
+      endpoint: "0.0.0.0:9464"
+      metric_expiration: 60m
+    loki:
+      endpoint: "http://loki:3100/loki/api/v1/push"
+  service:
+    pipelines:
+      traces:
+        receivers: [otlp]
+        exporters: [logging, loki]
+```
+
+Agents already expose OTLP spans in earlier phases; just set `OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4317`.
+
+---
+
+## 5  |  Event-Driven Autoscaling
+
+### 5.1  Kafka lag-based KEDA Scaler (`autoscaling/hpas/coding-agent-hpa.yaml`)
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: coding-agent-keda
+spec:
+  scaleTargetRef:
+    name: coding-agent                        # Deployment
+  pollingInterval: 30                        # seconds
+  cooldownPeriod: 120
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-headless:9092
+      topic: code.task.out
+      consumerGroup: coding-agent
+      lagThreshold: "200"            # each agent can handle ~200 tasks backlog
+```
+
+*(Similar ScaledObjects for `ci_runner`, `test_builder` etc.)*
+
+### 5.2  CPU-based HPA fallback
+
+```yaml
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rag-service-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: rag-service
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+```
+
+---
+
+## 6  |  Resource & Cost Management
+
+### 6.1  Goldilocks
+
+Deploy Goldilocks’ controller:
+
+```bash
+helm repo add fairwinds-stable https://charts.fairwinds.com/stable
+helm install goldilocks fairwinds-stable/goldilocks \
+  --namespace goldilocks --create-namespace
+```
+
+Annotate namespaces:
+
+```yaml
+metadata:
+  annotations:
+    goldilocks.fairwinds.com/enabled: "true"
+```
+
+Goldilocks provides recommended CPU/memory for each Deployment.
+
+### 6.2  Kubecost (optional)
+
+```bash
+helm repo add kubecost https://kubecost.github.io/cost-analyzer/
+helm install kubecost kubecost/cost-analyzer --namespace cost --create-namespace \
+  --set kubecostToken="CHANGEME"
+```
+
+Grafana dashboard `cost-summary.json` queries Kubecost Prometheus metrics.
+
+---
+
+## 7  |  Alerting Rules (PrometheusRule)
+
+`charts/monitoring/alerts.yaml`
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: self-healing-platform
+  labels: {release: prometheus}
+spec:
+  groups:
+  - name: pipeline.rules
+    rules:
+    - alert: HighPipelineFailureRate
+      expr: rate(orch_stage_total{stage="regress"}[5m]) > 0.05
+      for: 10m
+      labels: {severity: page}
+      annotations:
+        summary: "High regression rate"
+        description: "More than 5% of pipeline loops ended in regression in the last 10 min."
+    - alert: KafkaBacklogHigh
+      expr: kafka_consumergroup_lag{consumergroup="coding-agent"} > 1000
+      for: 15m
+      labels: {severity: warn}
+```
+
+Alertmanager routes `severity: page` to Ops on-call, `warn` to Slack.
+
+---
+
+## 8  |  CI/CD Integration
+
+* Change GitHub Actions to **export `.prom` test artifacts** when unit tests add new metrics.
+* `helmfile sync` in deploy workflow installs / upgrades monitoring stack in staging → prod.
+
+---
+
+## 9  |  README Ops Quick-Start (`docs/ops.md`)
+
+````markdown
+## Ops Quick-Start
+
+```bash
+# port-forward Prometheus & Grafana
+kubectl -n monitoring port-forward svc/prometheus-operated 9090 &
+kubectl -n monitoring port-forward svc/prometheus-grafana 3000:80 &
+open http://localhost:3000  (admin / prom-operator)
+````
+
+Dashboards:
+
+* **01\_Pipeline\_Funnel**
+* **02\_Agent\_Latency**
+* **03\_Kafka\_Lag**
+* **04\_Cost\_Summary**
+
+````
+
+---
+
+## 10  |  Commit & Tag
+
+```bash
+git add charts/monitoring charts/tracing charts/logging charts/autoscaling \
+        helmfile.yaml docs/ops.md
+git commit -m "phase10: observability stack, autoscaling, and cost tracking"
+git push origin main
+git tag phase-10-complete
+git push origin phase-10-complete
+````
+
+---
+
+### Phase 10 complete
+
+*Prometheus, Grafana, Loki, OpenTelemetry, KEDA, and (optionally) Kubecost are now deployed via Helm. Every agent exports metrics and traces; autoscaling reacts to Kafka back-pressure; dashboards and alerts provide a real-time window into pipeline health and cost. The self-healing platform is production-ready.*

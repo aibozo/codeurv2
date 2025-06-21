@@ -1,0 +1,258 @@
+### Phase 1.5 — Git-Adapter Micro-service
+
+*A stateless, gRPC/HTTP façade around Git that all agents can call instead of shelling out to `git`. It eliminates duplicated Git logic, centralises credentials, and lets you drop network traffic by re-using a local bare-repo cache.*
+
+---
+
+## 1  |  Why we need it
+
+| Benefit           | Detail                                                                                                                                                   |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Consistency**   | Every agent gets identical `diff`, `read_file`, `blame` semantics (no more `git show` vs `gitpython` discrepancies).                                     |
+| **Security**      | All SSH deploy keys live in **one** pod; Coding-Agent/Test-Builder jobs mount the service’s *read-only* REST endpoint instead of embedding private keys. |
+| **Performance**   | Bare repos cached under `/var/git-cache`; most requests hit local disk not the origin.                                                                   |
+| **Observability** | Easy to meter Git traffic (`git_adapter_bytes_total`) and latency.                                                                                       |
+
+---
+
+## 2  |  High-level design
+
+```
+┌────────────────────────┐      grpc+http     ┌────────────────────┐
+│   Agent (e.g. CA/TP)   │◄──────────────────►│  Git-Adapter Pod    │
+└────────────────────────┘                    │  • pygit2 backend   │
+           ▲                                  │  • /cache           │
+           │                                  │  • Prom metrics     │
+           │                                  └─────────┬──────────┘
+           │ fetch/diff/blame                              │
+           ▼                                               ▼
+                           /var/git-cache/<repo>.git  ←  git clone --mirror
+```
+
+*One **Deployment** with an **emptyDir** (`/var/git-cache`) acts as an on-node mirror cache; requests for uncached repos perform a shallow mirror on demand.*
+
+---
+
+## 3  |  gRPC & REST contracts (proto)
+
+`proto/git_adapter.proto`
+
+```proto
+syntax = "proto3";
+package git;
+
+message Repo { string url = 1; }
+
+message CheckoutRequest  { Repo repo = 1; string ref = 2; } // branch, tag, or sha
+message CheckoutReply    { string workdir = 1; string commit_sha = 2; }
+
+message ReadFileRequest  { Repo repo = 1; string ref = 2; string path = 3; }
+message ReadFileReply    { bytes content = 1; }
+
+message DiffRequest      { Repo repo = 1; string base = 2; string head = 3; }
+message DiffReply        { string unified_diff = 1; }
+
+message BlameRequest     { Repo repo = 1; string ref = 2; string path = 3; }
+message BlameReply       { repeated string commits = 1; }
+
+service GitAdapter {
+  rpc Checkout (CheckoutRequest) returns (CheckoutReply);
+  rpc ReadFile (ReadFileRequest) returns (ReadFileReply);
+  rpc Diff    (DiffRequest)      returns (DiffReply);
+  rpc Blame   (BlameRequest)     returns (BlameReply);
+}
+```
+
+---
+
+## 4  |  Dependencies
+
+```toml
+[tool.poetry.dependencies]
+pygit2     = "^1.14"
+fastapi    = "^0.112"
+uvicorn    = {extras = ["standard"], version="^0.30"}
+grpcio     = "^1.65"
+grpcio-tools = "^1.65"
+aiofiles   = "^23.2"
+prometheus-client = "^0.20"
+```
+
+---
+
+## 5  |  Service skeleton
+
+`apps/git_adapter/server.py`
+
+```python
+import os, tempfile, shutil, logging, asyncio, hashlib, functools
+from pathlib import Path
+from fastapi import FastAPI, HTTPException
+import pygit2
+from prometheus_client import Counter, Histogram, make_asgi_app
+
+CACHE = Path(os.getenv("GIT_CACHE", "/var/git-cache"))
+CACHE.mkdir(parents=True, exist_ok=True)
+log = logging.getLogger("git-adapter")
+
+REQUESTS = Counter("ga_requests_total", "requests", ["rpc"])
+LATENCY  = Histogram("ga_latency_sec", "latency", ["rpc"])
+
+def _cache_path(url: str) -> Path:
+    h = hashlib.md5(url.encode()).hexdigest()[:12]
+    return CACHE / f"{h}.git"
+
+def _ensure_mirror(url: str) -> pygit2.Repository:
+    path = _cache_path(url)
+    if not path.exists():
+        log.info("mirroring %s", url)
+        pygit2.clone_repository(url, str(path), bare=True)
+    repo = pygit2.Repository(str(path))
+    return repo
+
+def _checkout(repo: pygit2.Repository, ref: str) -> Path:
+    commit = repo.revparse_single(ref)
+    work = Path(tempfile.mkdtemp())
+    pygit2.clone_repository(repo.path, str(work), checkout_branch=commit.hex)
+    return work, commit.hex
+
+app = FastAPI(title="Git Adapter")
+app.mount("/metrics", make_asgi_app())
+
+@app.post("/checkout")
+@LATENCY.labels("checkout").time()
+async def checkout(body: dict):
+    REQUESTS.labels("checkout").inc()
+    repo = _ensure_mirror(body["repo"]["url"])
+    wd, sha = _checkout(repo, body["ref"])
+    return {"workdir": str(wd), "commit_sha": sha}
+
+@app.get("/read_file")
+@LATENCY.labels("read_file").time()
+async def read_file(repo_url: str, ref: str, path: str):
+    REQUESTS.labels("read_file").inc()
+    repo = _ensure_mirror(repo_url)
+    blob = repo.revparse_single(f"{ref}:{path}")
+    return blob.data
+```
+
+*(Add `/diff` and `/blame` similarly using pygit2 APIs.)*
+
+Create matching gRPC server (`apps/git_adapter/grpc_server.py`) that wraps the same functions.
+
+---
+
+## 6  |  Dockerfile
+
+`apps/git_adapter/Dockerfile`
+
+```dockerfile
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y git libgit2-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY pyproject.toml poetry.lock* /app/
+RUN pip install --no-cache-dir poetry && poetry export -f requirements.txt --without-hashes | pip install -r /dev/stdin
+COPY apps/git_adapter /app/apps/git_adapter
+EXPOSE 8200 8300
+CMD ["python", "-m", "apps.git_adapter.startup"]
+```
+
+`startup.py` launches both FastAPI (port 8200) and gRPC (8300) in asyncio tasks.
+
+---
+
+## 7  |  Compose addition
+
+```yaml
+  git_adapter:
+    build: ./apps/git_adapter
+    environment:
+      GIT_CACHE: /git-cache
+    volumes:
+      - git-cache:/git-cache
+    ports:
+      - "8200:8200"
+    deploy: {replicas: 1}
+
+volumes:
+  git-cache:
+```
+
+Agents now set `GIT_ADAPTER_ENDPOINT=http://git_adapter:8200`.
+
+---
+
+## 8  |  Python client stub
+
+`clients/git_client.py`
+
+```python
+import aiohttp, os, json, asyncio
+BASE = os.getenv("GIT_ADAPTER_ENDPOINT", "http://git_adapter:8200")
+
+async def read_file(repo_url, ref, path):
+    params = {"repo_url": repo_url, "ref": ref, "path": path}
+    async with aiohttp.ClientSession() as s:
+        r = await s.get(f"{BASE}/read_file", params=params, timeout=60)
+        r.raise_for_status()
+        return await r.read()
+```
+
+Agents swap shell calls for `await git_client.read_file(...)`.
+
+---
+
+## 9  |  Unit tests
+
+`apps/git_adapter/tests/test_read.py`
+
+```python
+import asyncio, pytest, subprocess, pathlib, textwrap
+from apps.git_adapter.server import _ensure_mirror
+
+@pytest.mark.asyncio
+async def test_mirror_and_read(tmp_path):
+    repo = tmp_path/"repo"; repo.mkdir()
+    (repo/"hello.py").write_text("print('hi')")
+    subprocess.run(["git","init"], cwd=repo, check=True)
+    subprocess.run(["git","add","."], cwd=repo, check=True)
+    subprocess.run(["git","commit","-m","init"], cwd=repo, check=True)
+
+    r = _ensure_mirror(str(repo))
+    assert r is not None
+```
+
+Add to CI matrix.
+
+---
+
+## 10  |  Agent code changes
+
+Example (Coding-Agent):
+
+```python
+-from pathlib import Path
+-... Path.read_text()
++from clients.git_client import read_file
++text = await read_file(REMOTE_REPO, task.base_commit_sha, task.path)
+```
+
+For `diff` operations replace shell `git diff` with `await git_client.diff(...)`.
+
+---
+
+## 11  |  Commit & Tag
+
+```bash
+git add proto/git_adapter.proto apps/git_adapter clients/git_client docker-compose.yml
+git commit -m "phase01.5: git-adapter micro-service + client SDK"
+git push origin main
+git tag phase-01.5-complete
+git push origin phase-01.5-complete
+```
+
+---
+
+### Phase 1.5 done
+
+*All agents can now call a single Git-Adapter service for cloning, reading, diffing, and blaming without bundling SSH keys or spawning git subprocesses.  Subsequent phases are unaffected—simply switch imports to `clients.git_client` as you touch each agent.*

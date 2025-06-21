@@ -1,0 +1,355 @@
+### Phase 02 — RAG Service Skeleton
+
+*Goal: spin up a **working Retrieval-Augmented-Generation micro-service** that supports dense + sparse hybrid search, snippet retrieval, and incremental Git ingestion.*
+
+---
+
+## 0  |  Prerequisites
+
+| Tool / Service | Version ≥ | Install check                               |
+| -------------- | --------- | ------------------------------------------- |
+| `protoc`       | 3.24      | `protoc --version`                          |
+| Docker engine  | 24.x      | `docker info`                               |
+| **GPU (opt.)** | CUDA 11.8 | for local embedding acceleration (else CPU) |
+
+> Phase 01’s Postgres & SRM stay running inside `docker-compose`.
+
+---
+
+## 1  |  Add protobuf contract
+
+`proto/rag.proto`
+
+```proto
+syntax = "proto3";
+package rag;
+
+message SearchQuery  { string query   = 1; int32 k = 2; float alpha = 3; }
+message DocRef       { string point_id  = 1; string snippet = 2; float score = 3; }
+message SearchReply  { repeated DocRef results = 1; }
+
+message SnippetRequest { string point_id = 1; int32 radius = 2; }
+message SnippetReply   { string text = 1; }
+
+service RagService {
+  rpc HybridSearch(SearchQuery)  returns (SearchReply);
+  rpc Snippet     (SnippetRequest) returns (SnippetReply);
+}
+```
+
+Generate stubs:
+
+```bash
+python -m grpc_tools.protoc -I proto \
+  --python_out=apps --grpc_python_out=apps proto/rag.proto
+```
+
+---
+
+## 2  |  Add dependencies
+
+`pyproject.toml`
+
+```toml
+[tool.poetry.dependencies]
+qdrant-client     = "^1.9"
+fastapi           = "^0.112"
+uvicorn           = {extras = ["standard"], version = "^0.30"}
+transformers      = "^4.44"
+sentence-transformers = "^3.0"
+scikit-learn      = "^1.5"
+tree-sitter       = "^0.22"
+aiofiles          = "^23.2"
+sqlite-utils      = "^3.36"
+```
+
+`poetry install`
+
+---
+
+## 3  |  Docker & Compose additions
+
+Extend root `docker-compose.yml`:
+
+```yaml
+  qdrant:
+    image: qdrant/qdrant:v1.9.0
+    ports: ["6333:6333"]
+    volumes: ["qdrant_data:/qdrant/storage"]
+
+  rag_service:
+    build: ./apps/rag_service
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      RAG_SQLITE_PATH: /rag/bm25.db
+    volumes: ["./.cache/rag:/rag"]
+    depends_on: [qdrant]
+    ports:
+      - "8000:8000"   # REST
+      - "9100:9100"   # gRPC
+volumes:
+  qdrant_data:
+```
+
+---
+
+## 4  |  Service skeleton
+
+### 4.1  `apps/rag_service/vector.py`
+
+```python
+import os, qdrant_client, numpy as np
+from qdrant_client.http import models as qmodels
+
+COLL = "code_chunks"
+DIM  = 768
+client = qdrant_client.QdrantClient(url=os.getenv("QDRANT_URL","http://localhost:6333"))
+
+def ensure_collection():
+    if COLL not in [c.name for c in client.get_collections().collections]:
+        client.create_collection(
+            collection_name=COLL,
+            vectors_config=qmodels.VectorParams(size=DIM, distance="Cosine")
+        )
+ensure_collection()
+
+def upsert_vectors(ids, vectors, payloads):
+    client.upsert(COLL, points=[
+        qmodels.PointStruct(id=i, vector=v, payload=p)
+        for i, v, p in zip(ids, vectors, payloads)
+    ])
+
+def search_dense(query_vec, k):
+    hits = client.search(COLL, query_vector=query_vec, limit=k)
+    return hits  # id, score
+```
+
+### 4.2  `apps/rag_service/bm25.py`
+
+```python
+import sqlite_utils, os
+DB_PATH = os.getenv("RAG_SQLITE_PATH","bm25.db")
+db = sqlite_utils.Database(DB_PATH)
+if "fts" not in db.table_names():
+    db["fts"].create({
+        "point_id": int, 
+        "content": str
+    }, pk="point_id")
+    db["fts"].enable_fts(["content"])
+
+def add_bm25_records(rows):
+    db["fts"].insert_all(rows, pk="point_id", replace=True)
+
+def bm25_search(query, k):
+    return list(db.query(
+        "SELECT point_id, bm25(fts) AS score, snippet(fts,0,'>','<','…',10) AS snip "
+        "FROM fts WHERE fts MATCH ? ORDER BY score LIMIT ?", (query, k)))
+```
+
+### 4.3  `apps/rag_service/embedding.py`
+
+```python
+from sentence_transformers import SentenceTransformer
+_model = SentenceTransformer("BAAI/bge-code-v1.5")
+
+def embed(texts):
+    return _model.encode(texts, normalize_embeddings=True).tolist()
+```
+
+### 4.4  `apps/rag_service/ingest.py`
+
+```python
+import subprocess, pathlib, itertools, hashlib, re, json
+from .embedding import embed
+from .vector import upsert_vectors
+from .bm25 import add_bm25_records
+
+TOKEN_SPLIT = re.compile(r"\n{2,}")
+
+def file_chunks(path, text):
+    for i, block in enumerate(TOKEN_SPLIT.split(text)):
+        if block.strip():
+            point_id = int(hashlib.md5(f"{path}:{i}".encode()).hexdigest()[:16],16)
+            yield point_id, block
+
+def ingest_git_commit(commit_sha, repo_dir):
+    changed = subprocess.check_output(
+        ["git","diff-tree","--no-commit-id","--name-only","-r",commit_sha],
+        cwd=repo_dir, text=True).splitlines()
+    for fp in changed:
+        full = pathlib.Path(repo_dir)/fp
+        if not full.exists(): continue
+        txt = full.read_text(encoding="utf-8", errors="ignore")
+        rows, payloads, vecs = [], [], []
+        for pid, chunk in file_chunks(fp, txt):
+            rows.append({"point_id": pid, "content": chunk})
+            payloads.append({"path": fp})
+            vecs.append(chunk)
+        if rows:
+            add_bm25_records(rows)
+            upsert_vectors([r["point_id"] for r in rows], embed(vecs), payloads)
+```
+
+*(A production system would use **tree-sitter** for language-aware chunks; plain paragraph splitting is okay for Phase 02.)*
+
+### 4.5  API & gRPC
+
+`apps/rag_service/api.py`
+
+```python
+from fastapi import FastAPI, HTTPException, Query
+from .vector import search_dense
+from .bm25 import bm25_search, db
+from .embedding import embed
+
+app = FastAPI(title="RAG Service")
+
+@app.get("/search")
+async def http_search(q: str = Query(...), k: int = 8, alpha: float = 0.25):
+    dense = search_dense(embed([q])[0], k*2)
+    sparse = bm25_search(q, k*2)
+    # fuse
+    scores = {}
+    for p in dense: scores[p.id] = alpha * p.score
+    for row in sparse:
+        scores[row["point_id"]] = scores.get(row["point_id"],0) + (1-alpha)/row["score"]
+    top = sorted(scores.items(), key=lambda x: -x[1])[:k]
+    results = []
+    for pid,_ in top:
+        snippet = db["fts"].get(pid)["content"][:200]
+        results.append({"point_id": pid, "snippet": snippet})
+    return {"results": results}
+
+@app.get("/snippet/{point_id}")
+async def http_snippet(point_id: int, radius: int = 20):
+    rec = db["fts"].get(point_id)
+    return {"text": rec["content"][:radius*10]}
+```
+
+`apps/rag_service/grpc_server.py`
+
+*(wrap `HybridSearch` & `Snippet` using the same logic).*
+
+`apps/rag_service/main.py`
+
+```python
+import asyncio, uvicorn
+from .api import app
+from .grpc_server import serve
+
+async def start():
+    asyncio.create_task(serve())
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+if __name__ == "__main__":
+    asyncio.run(start())
+```
+
+---
+
+## 5  |  Dockerfile
+
+`apps/rag_service/Dockerfile`
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY pyproject.toml poetry.lock* /app/
+RUN pip install --no-cache-dir poetry && \
+    poetry export -f requirements.txt --without-hashes | pip install -r /dev/stdin
+COPY apps/rag_service /app/apps/rag_service
+CMD ["python", "-m", "apps.rag_service.main"]
+```
+
+---
+
+## 6  |  Unit / integration tests
+
+`apps/rag_service/tests/test_search.py`
+
+```python
+import pytest, httpx, asyncio, os
+from apps.rag_service.ingest import ingest_git_commit
+
+@pytest.mark.asyncio
+async def test_search_flow(tmp_path):
+    # create tiny git repo
+    import subprocess, textwrap, shutil
+    repo = tmp_path/"repo"; repo.mkdir()
+    subprocess.run(["git","init"], cwd=repo, check=True)
+    (repo/"hello.py").write_text("def greet():\n    print('hi')\n")
+    subprocess.run(["git","add","."], cwd=repo, check=True)
+    subprocess.run(["git","commit","-m","init"], cwd=repo, check=True)
+    sha = subprocess.check_output(["git","rev-parse","HEAD"], cwd=repo,text=True).strip()
+    # ingest
+    ingest_git_commit(sha, repo)
+    async with httpx.AsyncClient(base_url="http://localhost:8000") as c:
+        r = await c.get("/search", params={"q":"greet", "k":3})
+        assert r.json()["results"]
+```
+
+Add PostgreSQL & Qdrant services to GitHub Actions matrix (`services:` block).
+
+---
+
+## 7  |  Local run & smoke test
+
+```bash
+docker compose up --build rag_service qdrant
+# new terminal
+echo -e "def add(a,b):\n    return a+b\n" > demo.py
+git init && git add demo.py && git commit -m x
+python - <<'PY'
+from apps.rag_service.ingest import ingest_git_commit
+import subprocess, os, pathlib, json, httpx, asyncio
+sha=subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip()
+ingest_git_commit(sha,".")
+async def go():
+    async with httpx.AsyncClient() as c:
+        res = await c.get("http://localhost:8000/search", params={"q":"add"})
+        print(res.json())
+asyncio.run(go())
+PY
+```
+
+You should see a JSON with the snippet for `add`.
+
+---
+
+## 8  |  Prometheus metrics
+
+Append to `api.py`:
+
+```python
+from prometheus_client import make_asgi_app, Counter
+SEARCH_QPS = Counter("rag_search_total","search calls")
+app.mount("/metrics", make_asgi_app())
+```
+
+Increment inside `/search`.
+
+---
+
+## 9  |  CI updates
+
+* Add `qdrant` service to workflow.
+* Run `pytest apps/rag_service/tests -q`.
+
+---
+
+## 10  |  Commit & tag
+
+```bash
+git add proto apps/rag_service docker-compose.yml
+git commit -m "phase02: basic RAG service with hybrid search & ingest"
+git push origin main
+git tag phase-02-complete
+git push origin phase-02-complete
+```
+
+---
+
+### Phase 02 complete
+
+*Hybrid RAG service is live, searchable, and ingesting Git commits.*
+Ready for **Phase 03 – Orchestrator skeleton & message contracts.**

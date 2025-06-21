@@ -1,0 +1,258 @@
+Below is a **drop-in “LLM Connector” package** that every agent can import the same way it already imports `RagClient` or `SrmClient`. You’ll get:
+
+* a uniform, async API (`llm.generate()` and `llm.chat()`)
+* pluggable back-ends (OpenAI, Anthropic, Ollama / local LLaMA-3, etc.)
+* built-in exponential-back-off, token/\$\$ cost logging, and simple in-memory cache
+* streaming support for agents that need it later
+
+You can commit this as `clients/llm_client/` and ***replace every direct `openai.ChatCompletion` call*** with a one-liner import.
+
+---
+
+## 1  |  Directory & files
+
+```
+clients/
+└── llm_client/
+    ├── __init__.py
+    ├── base.py              # provider interface
+    ├── openai_provider.py
+    ├── ollama_provider.py   # example local backend
+    ├── router.py            # chooses provider from ENV
+    └── cache.py             # naive in-mem / disk cache
+```
+
+---
+
+## 2  |  `base.py` – provider interface
+
+```python
+from __future__ import annotations
+import abc, typing as _t
+from dataclasses import dataclass
+
+@dataclass
+class LLMResponse:
+    content: str
+    tokens_prompt: int = 0
+    tokens_completion: int = 0
+    cost_usd: float = 0.0
+
+class BaseProvider(abc.ABC):
+    """All concrete providers must implement `chat`."""
+
+    name: str
+
+    @_t.override
+    @abc.abstractmethod
+    async def chat(
+        self,
+        messages: list[dict],
+        model: str,
+        temperature: float = 0.1,
+        json_mode: bool = False,
+        **kwargs,
+    ) -> LLMResponse: ...
+```
+
+---
+
+## 3  |  `openai_provider.py`
+
+```python
+import os, asyncio, backoff, logging
+from .base import BaseProvider, LLMResponse
+import openai
+
+log = logging.getLogger("llm.openai")
+
+_API_KEY = os.getenv("OPENAI_API_KEY")
+openai.api_key = _API_KEY
+_OPENAI_COST = {  # very simplified cost table USD / 1K tokens
+    "gpt-4o-mini": (0.005, 0.015),   # (prompt, completion)
+    "gpt-4o":      (0.01, 0.03),
+}
+
+class OpenAIProvider(BaseProvider):
+    name = "openai"
+
+    @backoff.on_exception(backoff.expo, openai.APIError, max_time=60)
+    async def chat(self, messages, model, temperature=0.1, json_mode=False, **kw):
+        log.debug("OpenAI call %s", model)
+        resp = await openai.ChatCompletion.acreate(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            response_format=( {"type":"json_object"} if json_mode else "text" ),
+            **kw,
+        )
+        choice = resp.choices[0].message
+        usage = resp.usage                    # prompt_tokens, completion_tokens
+        p_cost, c_cost = _OPENAI_COST.get(model, (0, 0))
+        usd = (usage.prompt_tokens / 1000) * p_cost + (usage.completion_tokens / 1000) * c_cost
+        return LLMResponse(
+            content=choice.content,
+            tokens_prompt=usage.prompt_tokens,
+            tokens_completion=usage.completion_tokens,
+            cost_usd=usd,
+        )
+```
+
+---
+
+## 4  |  `ollama_provider.py` (local / open-source)
+
+```python
+import aiohttp, asyncio, json
+from .base import BaseProvider, LLMResponse
+
+OLLAMA_URL = "http://ollama:11434/api/chat"
+
+class OllamaProvider(BaseProvider):
+    name = "ollama"
+
+    async def chat(self, messages, model, temperature=0.1, json_mode=False, **kw):
+        pay = {
+            "model": model,
+            "messages": messages,
+            "options": {"temperature": temperature},
+            "stream": False,
+        }
+        async with aiohttp.ClientSession() as sess:
+            r = await sess.post(OLLAMA_URL, json=pay, timeout=120)
+            data = await r.json()
+        # Ollama’s simple schema -> wrap
+        return LLMResponse(content=data["message"]["content"])
+```
+
+*(Add Anthropic, Azure OpenAI, Groq, etc. by copying this template.)*
+
+---
+
+## 5  |  `cache.py` – zero-dependency in-mem + optional disk cache
+
+```python
+import functools, hashlib, json, pathlib, os
+from .base import LLMResponse
+
+_CACHE_DIR = pathlib.Path(os.getenv("LLM_CACHE_DIR", ".llm_cache"))
+_CACHE_DIR.mkdir(exist_ok=True)
+
+def _key(model, messages, **kw):
+    data = {"m": model, "msg": messages, "kw": kw}
+    h = hashlib.sha256(json.dumps(data).encode()).hexdigest()
+    return _CACHE_DIR / f"{h}.json"
+
+def cached(func):
+    async def wrapper(*a, **kw):
+        k = _key(*a, **kw)
+        if k.exists():
+            return LLMResponse(**json.loads(k.read_text()))
+        res: LLMResponse = await func(*a, **kw)
+        k.write_text(json.dumps(res.__dict__))
+        return res
+    return wrapper
+```
+
+---
+
+## 6  |  `router.py` – selects provider via ENV
+
+```python
+import os, importlib
+from .base import BaseProvider
+
+_PROVIDER = os.getenv("LLM_BACKEND", "openai")  # openai | ollama | anthropic …
+_MODULE = f"clients.llm_client.{_PROVIDER}_provider"
+Provider: type[BaseProvider] = importlib.import_module(_MODULE).OpenAIProvider  # type: ignore
+_client: BaseProvider | None = None
+
+def get_client() -> BaseProvider:
+    global _client
+    if _client is None:
+        _client = Provider()
+    return _client
+```
+
+---
+
+## 7  |  Tiny user-facing helper (`__init__.py`)
+
+```python
+from .router import get_client
+
+async def chat(messages: list[dict], model: str, **kw):
+    return await get_client().chat(messages=messages, model=model, **kw)
+
+# Backwards-compat helpers so existing agent code is 1-line diff
+async def json_chat(messages, model):
+    res = await chat(messages, model, json_mode=True)
+    return res.content   # keep same shape as previous parse_json()
+```
+
+---
+
+## 8  |  Updating agents (example)
+
+Replace:
+
+```python
+resp = await openai.ChatCompletion.acreate(...)
+json.loads(resp.choices[0].message.content)
+```
+
+with:
+
+```python
+from clients.llm_client import chat
+res = await chat(messages, model="gpt-4o-mini", json_mode=True)
+js  = json.loads(res)
+```
+
+That’s it—same for Coding-Agent, Test-Builder, Architect, etc.
+
+---
+
+## 9  |  Extra goodies (optional)
+
+* **Rate-limit wrapper:** use `asyncio.Semaphore(int(os.getenv("LLM_QPS",3)))` around provider calls.
+* **Streaming:** expose `async def stream_chat(...): yield tokens`. Implement for providers that support it.
+* **Distributed cache:** swap `_CACHE_DIR` for Redis or Qdrant “text-to-hash” collection when needed.
+
+---
+
+## 10  |  CI & Local-dev
+
+* For tests, patch `get_client().chat` to a dummy coroutine that returns canned strings (similar to earlier unit tests).
+* Use `LLM_BACKEND=ollama` in **dev-compose** to avoid real API spend.
+* In GitHub Actions, set `LLM_BACKEND=dummy` and provide a `dummy_provider.py` that always echoes.
+
+---
+
+## 11  |  Security & Cost tracking
+
+* The `LLMResponse` carries `cost_usd`; aggregate per-agent Prometheus metric:
+
+```python
+from prometheus_client import Counter
+LLM_COST = Counter("llm_cost_usd_total","USD spent",["agent"])
+...
+resp = await chat(...)
+LLM_COST.labels("coding-agent").inc(resp.cost_usd)
+```
+
+* Rotate API keys via Kubernetes secrets; providers read `*_API_KEY` env vars.
+
+---
+
+## 12  |  Commit instructions
+
+```bash
+mkdir -p clients/llm_client
+# add files shown above
+git add clients/llm_client
+git commit -m "feat: unified LLM connector w/ pluggable providers + cache"
+```
+
+Stop here; **no other agent code has to change** except swapping two import lines.
+Now you have a *clean, swappable, measurable* path from any agent to any LLM back-end—cloud or local.

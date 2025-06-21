@@ -1,0 +1,268 @@
+### Phase 07 — Build / CI Runner
+
+*Goal: add a containerised **Build/CI Runner** that checks out the Coding-Agent’s feature branch, installs deps with cache reuse, runs lint + fast-test suite, computes coverage, saves an artefact, and publishes a `BuildReport` to Kafka.*
+
+---
+
+## 0  |  Prerequisites & Images
+
+| Tool / Service   | Version | Notes                                   |
+| ---------------- | ------- | --------------------------------------- |
+| `pytest`         | ≥ 8.2   | Already in dev-deps                     |
+| `coverage`       | 7.x     | for coverage JSON                       |
+| `pip-tools`      | 7.x     | lock & cache reuse                      |
+| Docker-in-Docker | yes     | the job container pulls the repo itself |
+
+Add deps to **`pyproject.toml`**:
+
+```toml
+[tool.poetry.group.ci.dependencies]
+pytest        = "^8.2"
+coverage      = {extras = ["toml"], version = "^7.5"}
+pytest-testmon = "^2.1"
+ruff          = "^0.4"
+black         = "^24.4"
+```
+
+`poetry install --with ci`
+
+---
+
+## 1  |  `BuildReport` proto (already defined)
+
+Recap for clarity:
+
+```proto
+message BuildReport {
+  string commit_sha  = 1;
+  string status      = 2;   // PASSED | FAILED | ERRORED
+  repeated string failed_tests = 3;
+  repeated string lint_errors  = 4;
+  double line_coverage         = 5;
+  string artefact_url          = 6;
+}
+```
+
+---
+
+## 2  |  Runner logic
+
+`apps/ci_runner/run.py`
+
+```python
+import os, subprocess, shutil, json, tempfile, logging, pathlib, tarfile
+from pathlib import Path
+from confluent_kafka import Consumer, Producer, KafkaError
+from apps.core_contracts_pb2 import CommitResult, BuildReport
+from apps.orchestrator import topics as T
+
+BOOT = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
+REMOTE_REPO = os.getenv("REMOTE_REPO")
+TEST_MARKER = os.getenv("PYTEST_MARK", "fast")
+ARTEFACT_BUCKET = "/artefacts"          # mounted path (MinIO or host volume)
+
+log = logging.getLogger("ci-runner")
+
+consumer = Consumer({
+    "bootstrap.servers": BOOT,
+    "group.id": "ci-runner",
+    "auto.offset.reset": "earliest"
+})
+consumer.subscribe([T.CRES])                     # CommitResult SUCCESS
+
+producer = Producer({"bootstrap.servers": BOOT})
+
+def run(cmd: list, cwd: str | Path, check=True):
+    log.debug("RUN %s", " ".join(cmd))
+    return subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True, check=check)
+
+def build(commit_sha: str, branch: str) -> BuildReport:
+    work = Path(tempfile.mkdtemp())
+    repo = work / "repo"
+    run(["git", "clone", "--depth", "1", "--branch", branch, REMOTE_REPO, str(repo)], cwd=work)
+    run(["git", "checkout", commit_sha], cwd=repo)
+
+    # Dependency cache (pip-tools lock optional)
+    run(["python", "-m", "pip", "install", "-r", "requirements.txt", "--cache-dir", "/pipcache"], cwd=repo)
+
+    # Formatting + linting
+    lint_out, failures = [], []
+    for cmd in (["black", "--check", "."], ["ruff", "."]):
+        r = subprocess.run(cmd, cwd=repo, capture_output=True, text=True)
+        if r.returncode:
+            lint_out.append(r.stdout + r.stderr)
+
+    # Pytest selective
+    test_cmd = ["pytest", "-q", f"-m{TEST_MARKER}", "--cov", "--cov-report=json:cov.json"]
+    r = subprocess.run(test_cmd, cwd=repo, capture_output=True, text=True)
+    if r.returncode:
+        failures = [l for l in r.stdout.splitlines() if "FAILED" in l]
+
+    # Coverage %
+    cov_path = repo / "cov.json"
+    if cov_path.exists():
+        cov = json.loads(cov_path.read_text())
+        line_cov = cov["totals"]["percent_covered"]
+    else:
+        line_cov = 0.0
+
+    # Tarball artefact
+    artefact_file = Path(ARTEFACT_BUCKET) / f"{commit_sha}.tar.gz"
+    with tarfile.open(artefact_file, "w:gz") as tar:
+        tar.add(repo, arcname="repo")
+
+    status = "PASSED" if not lint_out and not failures and r.returncode == 0 else "FAILED"
+    return BuildReport(
+        commit_sha=commit_sha,
+        status=status,
+        failed_tests=failures,
+        lint_errors=lint_out,
+        line_coverage=line_cov,
+        artefact_url=str(artefact_file)
+    )
+
+def main():
+    while True:
+        msg = consumer.poll(0.3)
+        if not msg:
+            continue
+        if msg.error() and msg.error().code() != KafkaError._PARTITION_EOF:
+            log.error(msg.error())
+            continue
+        cres = CommitResult.FromString(msg.value())
+        if cres.status != "SUCCESS":
+            continue    # ignore failed tasks
+
+        br = build(cres.commit_sha, cres.branch_name)
+        producer.produce(T.BREPORT, br.SerializeToString())
+        producer.flush()
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 3  |  Dockerfile
+
+`apps/ci_runner/Dockerfile`
+
+```dockerfile
+FROM python:3.11
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY pyproject.toml poetry.lock* /app/
+RUN pip install poetry && poetry export -f requirements.txt --without-hashes --with ci | pip install -r /dev/stdin
+COPY apps/ci_runner /app/apps/ci_runner
+ENV PYTEST_ADDOPTS="-q"
+CMD ["python", "-m", "apps.ci_runner.run"]
+```
+
+---
+
+## 4  |  Compose addition
+
+```yaml
+  ci_runner:
+    build: ./apps/ci_runner
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      REMOTE_REPO: "https://github.com/your-org/self-healing-code"
+    volumes:
+      - ./artefacts:/artefacts
+    depends_on: [kafka, orchestrator]
+    deploy:
+      replicas: 3
+```
+
+*(Multiple replicas allow parallel builds when many Coding-Tasks finish.)*
+
+---
+
+## 5  |  Unit “dry” test
+
+`apps/ci_runner/tests/test_report.py`
+
+```python
+from apps.ci_runner.run import BuildReport
+def test_report_proto():
+    br = BuildReport(commit_sha="abc", status="PASSED", line_coverage=90.0)
+    data = br.SerializeToString()
+    br2 = BuildReport.FromString(data)
+    assert br2.status == "PASSED"
+```
+
+Add to CI.
+
+---
+
+## 6  |  Metrics
+
+Modify `build()` to increment Prometheus counters:
+
+```python
+from prometheus_client import Counter, Histogram, start_http_server
+BUILD_LAT = Histogram("ci_build_latency_sec","build duration")
+BUILD_OK  = Counter("ci_build_ok_total","build passed")
+BUILD_FAIL= Counter("ci_build_fail_total","build failed")
+start_http_server(9700)
+
+def build(...):
+    with BUILD_LAT.time():
+        ...
+    if status=="PASSED": BUILD_OK.inc()
+    else: BUILD_FAIL.inc()
+```
+
+---
+
+## 7  |  Orchestrator flow confirmation
+
+Runner produces `BREPORT` messages. Orchestrator already listens and branches to:
+
+* BUILD1 → TESTPLAN on PASSED
+* BUILD\_fail → REGRESS
+
+No changes required.
+
+---
+
+## 8  |  Smoke test end-to-end
+
+```bash
+docker compose up --build -d \
+   kafka zookeeper postgres qdrant srm rag_service \
+   orchestrator request_planner code_planner coding_agent ci_runner
+
+python scripts/mock_change_request.py
+docker-compose logs -f ci_runner | grep BuildReport
+docker-compose logs -f orchestrator | tail
+```
+
+You should see:
+
+```
+orchestrator  ... build_phase_1  PASSED … moving to test_plan_phase
+```
+
+*(Test-Planner isn’t in place yet, so orchestration will wait there — that’s okay.)*
+
+---
+
+## 9  |  Commit & Tag
+
+```bash
+git add apps/ci_runner docker-compose.yml
+git commit -m "phase07: build/ci runner with lint + fast tests + coverage"
+git push origin main
+git tag phase-07-complete
+git push origin phase-07-complete
+```
+
+---
+
+### Phase 07 complete
+
+*Build/CI Runner containers now watch for successful Coding-Agent commits, spin isolated builds, run formatting, linting, and the “fast” test shard, compute coverage, store an artefact, and publish a `BuildReport`.  The Orchestrator automatically advances to Test-Planner on green or emits regression on red.*
+
+Next up: **Phase 08 — Test-Planner & Test-Builder**.

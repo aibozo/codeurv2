@@ -1,0 +1,149 @@
+Below is a **single-page reference sheet** you can paste into `docs/architecture.md`.
+It fits on ≈ 3 screens, yet gives a new engineer everything they need to grasp—names, files, flows, commands, and where to look first.
+
+---
+
+```
+ ┌──────────────────────────  Runtime Control Plane  ───────────────────────────┐
+ │                       Kubernetes  +  Kafka  +  Postgres                     │
+ └──────────────────────────────────────────────────────────────────────────────┘
+        ▲                        ▲                         ▲
+        │                        │                         │
+User ⇄ UX-Board (SPA) ⇄ UX-Agent WS  ←→  Architect-Agent (LLM)          (Phase 09)
+        │                                                   │
+        │ deep-plan in                                      │ regression / summary
+        ▼                                                   ▼
+┌─── Topic: change.request.in ────────────────────────────────────────────────┐
+│ Request-Planner  (Phase 04)                                                 │
+│   • SRM.reserve() symbols                                                   │
+│   • RagClient.hybrid_search() context                                       │
+│   • emits ➊ **Plan** → plan.out                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                               ▼
+┌─── Topic: plan.out ─────────────────────────────────────────────────────────┐
+│ Code-Planner  (Phase 05)                                                   │
+│   • builds per-step **CodingTask** w/ RAG blob_ids                         │
+│   • emits **TaskBundle** → code.task.out                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                               ▼
+┌── Parallel per task ────────────────────────────────────────────────────────┐
+│ Coding-Agent   (Phase 06)                                                  │
+│   • pulls repo via Git-Adapter + Git-Cache sidecar                         │
+│   • uses LLM-Connector.chat() to draft patch                               │
+│   • black → ruff → pytest -m fast                                          │
+│   • git push agt/<task_id>; SRM.claim()                                    │
+│   • emits **CommitResult** → commit.result.out                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                               ▼
+┌── Build/CI Runner  (Phase 07) ──────────────────────────────────────────────┐
+│   • clones via cache; installs deps                                         │
+│   • black/ruff again, pytest fast, coverage                                │
+│   • artefact tar.gz to MinIO                                               │
+│   • emits **BuildReport** → build.report.out                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                               ▼
+┌── Test-Planner → Test-Builder  (Phase 08) ──────────────────────────────────┐
+│   Test-Planner: find coverage gaps → **TestSpec**                           │
+│   Test-Builder: LLM generates tests, self-runs pytest, pushes commit        │
+│   emits **GeneratedTests** → generated.tests.out                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+                               ▼
+Second Build/CI Runner ➜ Orchestrator marks **DONE** or **REGRESSION**
+
+```
+
+---
+
+## 1 | Repository Cheat-Sheet
+
+| Path                       | Most important files                                                  |
+| -------------------------- | --------------------------------------------------------------------- |
+| **apps/orchestrator/**     | `main.py` FSM loop • `topics.py` constants                            |
+| **apps/symbol\_registry/** | `api.py` FastAPI routes • `db.py` SQLModel                            |
+| **apps/rag\_service/**     | `api.py` Search & Snippet • `ingest.py`                               |
+| **clients/llm\_client/**   | `router.py` provider switch • `openai_provider.py`                    |
+| **clients/rag\_client/**   | `_http.py` async wrappers (`hybrid_search`, `snippet`)                |
+| **clients/kafka\_utils/**  | `producer.py` (`produce`) • `consumer.py` (`AsyncConsumer`)           |
+| **apps/git\_adapter/**     | `server.py` read/diff/blame • `_ensure_mirror()`                      |
+| **apps/git\_cache/**       | `fetch.sh` sidecar mirror script                                      |
+| **agents folders**         | `agent.py` (core loop) • `prometheus_client.start_http_server()` line |
+| **proto/**                 | `core_contracts.proto`, `git_adapter.proto`, `phase_plan.proto`       |
+| **charts/**                | `monitoring/` Prom/Grafana • `autoscaling/` KEDA scalers              |
+| **ui/dashboard/**          | `src/api/socket.ts` WS client • `pages/*.tsx`                         |
+
+---
+
+## 2 | Key Data Contracts (protobuf topics)
+
+| Topic                 | Proto message (file)            | Produced by → Consumed by               |
+| --------------------- | ------------------------------- | --------------------------------------- |
+| `change.request.in`   | `ChangeRequest` (core)          | UX-Agent/User → Request-Planner         |
+| `plan.out`            | `Plan` (core)                   | Request-Planner → Code-Planner          |
+| `code.task.out`       | `TaskBundle` (core)             | Code-Planner → Coding-Agents            |
+| `commit.result.out`   | `CommitResult` (core)           | Coding-Agents → CI Runner               |
+| `build.report.out`    | `BuildReport` (core)            | CI Runner → Test-Planner / Orchestrator |
+| `test.spec.out`       | `TestSpec` (core)               | Test-Planner → Test-Builder             |
+| `generated.tests.out` | `GeneratedTests` (core)         | Test-Builder → CI Runner                |
+| `phaseplan.out`       | `PhasePlan` (phase\_plan.proto) | Architect → Orchestrator                |
+| `ux.reply.out`        | JSON envelope                   | Architect / Pipeline → UX-Board         |
+
+---
+
+## 3 | Agent Skeleton (all follow this pattern)
+
+```python
+from clients.kafka_utils import produce, AsyncConsumer
+from clients.rag_client import hybrid_search
+from clients.llm_client import chat
+
+async for topic, msg in AsyncConsumer("code-planner", [TOPIC_PLAN], proto_map={TOPIC_PLAN: Plan}):
+    ctx = await hybrid_search(msg.steps[0].goal, k=6)
+    llm = await chat([...], model="gpt-4o-mini", json_mode=True)
+    await produce(TOPIC_TASK, task_bundle)
+```
+
+*Every loop ≤ 60 lines thanks to shared SDKs.*
+
+---
+
+## 4 | Start-to-Finish CLI (dev-compose)
+
+```bash
+# 1. bring up infra + all agents
+docker compose up --build -d
+
+# 2. send a change request
+python scripts/mock_change_request.py  # edits README
+
+# 3. tail orchestrator state
+docker compose logs -f orchestrator
+
+# 4. open status board
+open http://localhost:8088/dashboard/
+```
+
+---
+
+## 5 | Operational Pointers
+
+| What                    | Command / URL                                                                 |
+| ----------------------- | ----------------------------------------------------------------------------- |
+| **Grafana** dashboards  | `http://localhost:3000` (admin / prom-operator)                               |
+| **Prometheus** query    | `http://localhost:9090`                                                       |
+| **Kafka lag**           | Dashboard *Kafka Lag* or `kafkacat -L`                                        |
+| **Scale coding-agents** | `kubectl scale deploy coding-agent --replicas=6` (KEDA does it automatically) |
+| **Flush git cache**     | `kubectl delete pod -l app=git-cache-init`                                    |
+| **Replay a message**    | `kafka-console-producer` ➜ topic name (`.SerializeToString()` bytes)          |
+
+---
+
+## 6 | Reading Order for New Engineers
+
+1. **docs/architecture.md** *(this file)*
+2. `proto/core_contracts.proto` → see schemas
+3. `clients/kafka_utils` → publish / subscribe pattern
+4. `agents/request_planner/agent.py` → smallest full agent
+5. `apps/git_adapter/server.py` + `apps/git_cache/fetch.sh` → how code checkout is done
+6. Dashboards in Grafana → see pipeline in action
+
+After \~1 hour an engineer can add a *new* agent or extend an existing one with confidence.

@@ -1,0 +1,276 @@
+### Phase 09 — Architect & UX Agents
+
+*Goal: introduce a long-lived, “expensive-brain” **Architect** agent that turns user ideas into ordered `PhasePlan`s, and a lightweight **UX-Agent** that’s the main human touch-point, streaming progress, summaries, and routing feedback back to the Architect. When Phase 09 merges your pipeline will feel like a product-grade user experience.*
+
+---
+
+## 0  |  Prerequisites & Libraries
+
+| Library / Service              | Purpose                     | Install                    |
+| ------------------------------ | --------------------------- | -------------------------- |
+| `fastapi` + `uvicorn`          | UX HTTP/WebSocket gateway   | already used               |
+| `starlette-websockets`         | real-time updates           | bundled in FastAPI         |
+| `sse-starlette` (optional)     | Server-Sent Events fallback | `poetry add sse-starlette` |
+| `openai` (`gpt-4o` / `opus-4`) | Architect reasoning         | already installed          |
+| `aio-pika`                     | async AMQP↔UX bridge        | `poetry add aio-pika`      |
+
+---
+
+## 1  |  Proto additions
+
+`proto/phase_plan.proto`
+
+```proto
+syntax = "proto3";
+package architect;
+
+message PhasePlan {
+  string id        = 1;
+  string deepplan_id = 2;
+  int32  index     = 3;          // phase order
+  string goal      = 4;
+  repeated string namespace_prefixes = 5; // e.g. billing_*
+  string rationale_md = 6;
+}
+```
+
+Generate stubs:
+
+```bash
+python -m grpc_tools.protoc -I proto --python_out=apps proto/phase_plan.proto
+```
+
+Kafka topic constants (`apps/orchestrator/topics.py`):
+
+```python
+PHASEPLAN = "phaseplan.out"
+UXPROMPT  = "ux.prompt.in"
+UXREPLY   = "ux.reply.out"
+```
+
+---
+
+## 2  |  Architect Agent
+
+`apps/agents/architect/agent.py`
+
+```python
+import asyncio, os, uuid, json, logging
+from confluent_kafka import Consumer, Producer, KafkaError
+from apps.core_contracts_pb2 import DeepPlan
+from apps.phase_plan_pb2 import PhasePlan
+from apps.orchestrator import topics as T
+import openai, tiktoken
+
+BOOT=os.getenv("KAFKA_BOOTSTRAP","kafka:9092")
+LLM=os.getenv("ARCH_MODEL","gpt-4o")
+producer=Producer({"bootstrap.servers":BOOT})
+consumer=Consumer({"bootstrap.servers":BOOT,
+                   "group.id":"architect","auto.offset.reset":"earliest"})
+consumer.subscribe([T.DEEP, T.UXPROMPT, T.REG])   # deepplan, UX prompts, regressions
+log=logging.getLogger("architect")
+
+async def llm_to_phases(deepplan:DeepPlan)->list[PhasePlan]:
+    user=deepplan.phases[0].goal if deepplan.phases else deepplan.id
+    msg=[{"role":"system","content":"You are Architect-Agent. Break request into ordered phases. Return JSON."},
+         {"role":"user","content":user}]
+    res=await openai.ChatCompletion.acreate(model=LLM, messages=msg,
+        response_format={"type":"json_object"})
+    js=json.loads(res.choices[0].message.content)["phases"]
+    plans=[]
+    for i,p in enumerate(js,1):
+        plans.append(PhasePlan(
+            id=str(uuid.uuid4()),
+            deepplan_id=deepplan.id,
+            index=i,
+            goal=p["goal"],
+            namespace_prefixes=p.get("namespaces",[])
+        ))
+    return plans
+
+async def process_deep(msg):
+    dp=DeepPlan.FromString(msg.value())
+    plans=await llm_to_phases(dp)
+    for pp in plans:
+        producer.produce(T.PHASEPLAN, pp.SerializeToString())
+    producer.flush()
+    log.info("Architect emitted %d PhasePlans", len(plans))
+
+async def process_ux(msg):
+    # UXPrompt schema: {"user_id":..,"text":..,"context":..}
+    data=json.loads(msg.value())
+    reply="I received: "+data["text"]+"\n—Architect"
+    producer.produce(T.UXREPLY, json.dumps({"user_id":data["user_id"],"reply":reply}).encode())
+
+async def process_reg(msg):
+    # regression summarised to Architect for decision, simple echo
+    producer.produce(T.UXREPLY, b'{"user_id":"admin","reply":"Regression received"}')
+
+async def main():
+    while True:
+        m=consumer.poll(0.3)
+        if not m: await asyncio.sleep(0.1); continue
+        if m.error() and m.error().code()!=KafkaError._PARTITION_EOF:
+            log.error(m.error()); continue
+        if m.topic()==T.DEEP:        await process_deep(m)
+        elif m.topic()==T.UXPROMPT:  await process_ux(m)
+        elif m.topic()==T.REG:       await process_reg(m)
+
+if __name__=="__main__":
+    asyncio.run(main())
+```
+
+*(In prod you’ll keep Architect state in Postgres and load historical context; this skeleton is stateless for brevity.)*
+
+---
+
+## 3  |  UX-Agent Gateway
+
+`apps/agents/ux_agent/server.py`
+
+```python
+import asyncio, json, os, uuid
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from confluent_kafka import Consumer, Producer
+from apps.orchestrator import topics as T
+
+BOOT=os.getenv("KAFKA_BOOTSTRAP","kafka:9092")
+app=FastAPI(title="UX-Gateway")
+producer=Producer({"bootstrap.servers":BOOT})
+consumer=Consumer({"bootstrap.servers":BOOT,
+                   "group.id":"ux-gw","auto.offset.reset":"earliest"})
+consumer.subscribe([T.UXREPLY, T.BREPORT, T.TSPEC, T.GTRES, T.REG])
+
+clients=set()
+
+@app.websocket("/ws")
+async def ws_endpoint(ws:WebSocket):
+    await ws.accept()
+    cid=str(uuid.uuid4()); clients.add(ws)
+    try:
+        while True:
+            txt=await ws.receive_text()
+            producer.produce(T.UXPROMPT, json.dumps({"user_id":cid,"text":txt}).encode())
+    except WebSocketDisconnect:
+        clients.remove(ws)
+
+async def kafka_fanout():
+    loop=asyncio.get_event_loop()
+    while True:
+        msg=consumer.poll(0.2)
+        if msg:
+            for ws in list(clients):
+                try: await ws.send_bytes(msg.value())
+                except Exception: clients.discard(ws)
+        await asyncio.sleep(0.1)
+
+@app.on_event("startup")
+async def start_listener():
+    asyncio.create_task(kafka_fanout())
+```
+
+Run with `uvicorn apps.agents.ux_agent.server:app --port 8088`.
+
+This minimal gateway:
+
+* pushes every UX-relevant Kafka message to connected WebSocket clients
+* forwards any client text back to the Architect as a `UXPROMPT`
+
+*front-end prototype* (`ui/dashboard/index.html`) can simply open a WebSocket and render JSON.
+
+---
+
+## 4  |  Dockerfiles & Compose
+
+`apps/agents/architect/Dockerfile` and `apps/agents/ux_agent/Dockerfile` similar to previous patterns.
+
+Compose snippet:
+
+```yaml
+  architect:
+    build: ./apps/agents/architect
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      OPENAI_API_KEY: "sk-dummy"
+    depends_on: [kafka]
+
+  ux_agent:
+    build: ./apps/agents/ux_agent
+    environment: {KAFKA_BOOTSTRAP: kafka:9092}
+    ports: ["8088:8088"]
+    depends_on: [kafka]
+```
+
+---
+
+## 5  |  Unit sanity tests
+
+`apps/agents/architect/tests/test_phaseplan_proto.py`
+
+```python
+from apps.phase_plan_pb2 import PhasePlan
+def test_proto_roundtrip():
+    pp=PhasePlan(id="1",deepplan_id="d1",index=1,goal="feat")
+    data=pp.SerializeToString()
+    assert PhasePlan.FromString(data).goal=="feat"
+```
+
+Added to CI.
+
+---
+
+## 6  |  Prometheus metrics
+
+Add per-agent counters:
+
+```python
+from prometheus_client import Counter, start_http_server
+PP_OUT=Counter("architect_phaseplan_total","phaseplans")
+start_http_server(9900)
+...
+PP_OUT.inc(len(plans))
+```
+
+and for UX-Agent connections.
+
+---
+
+## 7  |  Smoke Test
+
+```bash
+docker compose up --build -d kafka zookeeper architect ux_agent
+# send deepplan
+python - <<'PY'
+from apps.core_contracts_pb2 import DeepPlan, Phase
+from confluent_kafka import Producer
+import uuid, json
+p=Producer({"bootstrap.servers":"localhost:9092"})
+dp=DeepPlan(id=str(uuid.uuid4()))
+dp.phases.extend([Phase(id="p0",goal="Build SRM service")])
+p.produce("deepplan.in", dp.SerializeToString()); p.flush()
+PY
+
+docker-compose logs -f architect | grep PhasePlan
+# now connect websocket
+websocat ws://localhost:8088/ws
+```
+
+You should see PhasePlans arrive through the socket.
+
+---
+
+## 8  |  Commit & Tag
+
+```bash
+git add proto/phase_plan.proto apps/agents/architect apps/agents/ux_agent ui/dashboard docker-compose.yml
+git commit -m "phase09: architect agent + UX websocket gateway"
+git push origin main
+git tag phase-09-complete
+git push origin phase-09-complete
+```
+
+---
+
+### Phase 09 complete
+
+*Users can now connect to **`ws://<host>:8088/ws`** to watch live pipeline events and chat with the Architect.  The Architect breaks big ideas (DeepPlans) into ordered PhasePlans, reserves namespaces, and feeds them into the existing Planner stack.  Your self-healing loop is now fully interactive and multi-phase.*

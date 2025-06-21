@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package srm;
+
+message ReserveRequest {
+  string repo       = 1;
+  string branch     = 2;
+  string fq_name    = 3;
+  string kind       = 4;
+  string file_path  = 5;
+  string plan_id    = 6;
+  int32  ttl_sec    = 7;
+}
+
+message ReserveReply {
+  int64  lease_id   = 1;
+  string status     = 2;   // "reserved"
+  string expires_at = 3;
+}
+
+message ClaimRequest  { int64 lease_id = 1; string commit_sha = 2; }
+message ClaimReply    { string status  = 1; }
+message LookupRequest { string repo = 1; string branch = 2; string fq_name = 3; }
+message LookupReply   {
+  string status     = 1;
+  string file_path  = 2;
+  string commit_sha = 3;
+}
+
+service SymbolRegistry {
+  rpc Reserve(ReserveRequest) returns (ReserveReply);
+  rpc Claim  (ClaimRequest)   returns (ClaimReply);
+  rpc Lookup (LookupRequest)  returns (LookupReply);
+}

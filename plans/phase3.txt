@@ -1,0 +1,335 @@
+### Phase 03 — Orchestrator Skeleton & Core Message Contracts
+
+*Goal: land an event-driven **Orchestrator** that routes messages through the pipeline and persists minimal state.  We’ll also define every protobuf message the later agents share.*
+
+---
+
+## 0  |  Prerequisites & New Services
+
+| Tool / Service    | Min ver | Install check                                                                |
+| ----------------- | ------- | ---------------------------------------------------------------------------- |
+| Kafka             | 3.7     | pulled via Docker                                                            |
+| `confluent-kafka` | 2.4     | `python -c "import confluent_kafka, sys;print(confluent_kafka.__version__)"` |
+| `transitions`     | 0.9     | state-machine helper                                                         |
+
+Extend **`docker-compose.yml`**:
+
+```yaml
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.7.0
+    environment: {ZOOKEEPER_CLIENT_PORT: 2181}
+  kafka:
+    image: confluentinc/cp-kafka:7.7.0
+    depends_on: [zookeeper]
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+```
+
+---
+
+## 1  |  Add unified protobuf definitions
+
+`proto/core_contracts.proto`
+
+```proto
+syntax = "proto3";
+package core;
+
+message ChangeRequest {
+  string id          = 1;
+  string requester   = 2;
+  string repo        = 3;
+  string branch      = 4;
+  string description = 5;
+}
+
+message Plan           { string id = 1; string parent_request_id = 2; }
+message TaskBundle     { string plan_id = 1; repeated string task_ids = 2; }
+message CommitResult   { string task_id = 1; string commit_sha = 2; string status = 3; }
+message BuildReport    { string commit_sha = 1; string status = 2; }
+message TestSpec       { string id = 1; string parent_commit_sha = 2; }
+message GeneratedTests { string spec_id = 1; string commit_sha = 2; string precheck = 3; }
+message RegressionTicket { string id = 1; string summary = 2; }
+
+message DeepPlan { string id = 1; repeated Phase phases = 2; }
+message Phase    { string id = 1; string goal = 2; }
+```
+
+Generate Python stubs:
+
+```bash
+python -m grpc_tools.protoc -I proto --python_out=apps proto/core_contracts.proto
+```
+
+*(gRPC service definitions will come later; Orchestrator will just serialise to bytes and push to Kafka.)*
+
+---
+
+## 2  |  Add dependencies
+
+`pyproject.toml`
+
+```toml
+[tool.poetry.dependencies]
+confluent-kafka = "^2.4"
+transitions     = "^0.9"
+pydantic        = "^2.7"
+```
+
+```bash
+poetry install
+```
+
+---
+
+## 3  |  Topic naming constants
+
+`apps/orchestrator/topics.py`
+
+```python
+CRQ     = "change.request.in"
+DEEP    = "deepplan.in"
+PLAN    = "plan.out"
+TASK    = "code.task.out"
+CRES    = "commit.result.out"
+BREPORT = "build.report.out"
+TSPEC   = "test.spec.out"
+GTRES   = "generated.tests.out"
+REG     = "regression.out"
+```
+
+---
+
+## 4  |  State-machine model
+
+`apps/orchestrator/state_machine.py`
+
+```python
+from transitions import Machine, State
+from enum import Enum
+
+class Stage(str, Enum):
+    IDLE="idle"; PLAN="plan_phase"; CODE="code_phase"
+    BUILD1="build1"; TESTPLAN="test_plan"; TESTBUILD="test_build"
+    BUILD2="build2"; DONE="done"; REGRESS="regress"
+
+class OrchestratorFSM:
+    states = [State(s.value) for s in Stage]
+    def __init__(self):
+        self.machine = Machine(model=self, states=self.states, initial=Stage.IDLE.value)
+        self.machine.add_transition("crq",  Stage.IDLE,   Stage.PLAN)
+        self.machine.add_transition("plan", Stage.PLAN,   Stage.CODE)
+        self.machine.add_transition("code_ok", Stage.CODE, Stage.BUILD1)
+        self.machine.add_transition("build_ok", Stage.BUILD1, Stage.TESTPLAN)
+        self.machine.add_transition("build_fail", "*", Stage.REGRESS)
+        self.machine.add_transition("tspec", Stage.TESTPLAN, Stage.TESTBUILD)
+        self.machine.add_transition("gt_ok", Stage.TESTBUILD, Stage.BUILD2)
+        self.machine.add_transition("gt_fail", Stage.TESTBUILD, Stage.REGRESS)
+        self.machine.add_transition("build2_ok", Stage.BUILD2, Stage.DONE)
+```
+
+---
+
+## 5  |  Orchestrator main loop
+
+`apps/orchestrator/main.py`
+
+```python
+import asyncio, json, os, uuid
+from datetime import datetime
+from confluent_kafka import Producer, Consumer, KafkaError
+from apps.orchestrator.state_machine import OrchestratorFSM, Stage
+from apps.orchestrator import topics as T
+from apps import core_contracts_pb2 as pb
+
+BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP","kafka:9092")
+
+producer = Producer({"bootstrap.servers": BOOTSTRAP})
+consumer = Consumer({
+    "bootstrap.servers": BOOTSTRAP,
+    "group.id": "orchestrator",
+    "auto.offset.reset": "earliest"
+})
+SUBS = [T.CRQ, T.PLAN, T.TASK, T.CRES, T.BREPORT, T.TSPEC, T.GTRES]
+consumer.subscribe(SUBS)
+
+fsm = OrchestratorFSM()
+current_request_id = None
+pending_tasks = set()
+
+def emit(topic:str, msg):
+    producer.produce(topic, msg)
+    producer.poll(0)
+
+def handle_change_request(msg):
+    global current_request_id
+    cr = pb.ChangeRequest.FromString(msg.value())
+    current_request_id = cr.id
+    fsm.crq()
+    print("Request accepted", cr.id)
+    # forward to Architect / Planner
+    emit(T.DEEP, msg.value())
+
+async def main_loop():
+    while True:
+        msg = consumer.poll(0.2)
+        if msg is None: 
+            await asyncio.sleep(0.1); continue
+        if msg.error() and msg.error().code() != KafkaError._PARTITION_EOF:
+            print("Kafka error", msg.error()); continue
+        topic = msg.topic()
+        if topic == T.CRQ: handle_change_request(msg)
+        elif topic == T.PLAN:
+            fsm.plan(); emit(T.TASK, msg.value())
+        elif topic == T.CRES:
+            res = pb.CommitResult.FromString(msg.value())
+            if res.status == "SUCCESS":
+                pending_tasks.discard(res.task_id)
+            if not pending_tasks:
+                fsm.code_ok()
+        elif topic == T.BREPORT:
+            rep = pb.BuildReport.FromString(msg.value())
+            if rep.status == "PASSED":
+                if fsm.state == Stage.BUILD1.value: fsm.build_ok()
+                elif fsm.state == Stage.BUILD2.value: fsm.build2_ok()
+            else:
+                fsm.build_fail(); emit(T.REG, b"regression")
+        elif topic == T.TSPEC: fsm.tspec()
+        elif topic == T.GTRES:
+            gtr = pb.GeneratedTests.FromString(msg.value())
+            if gtr.precheck == "PASSED": fsm.gt_ok()
+            else: fsm.gt_fail()
+        else:
+            print("unrouted topic", topic)
+        # done?
+        if fsm.state == Stage.DONE.value:
+            print("✓ Pipeline complete for", current_request_id)
+            fsm.to_idle()   # reset
+        producer.flush(0)
+```
+
+Entrypoint script:
+
+`apps/orchestrator/__main__.py`
+
+```python
+import asyncio, signal
+from .main import main_loop
+
+loop = asyncio.get_event_loop()
+task = loop.create_task(main_loop())
+for s in (signal.SIGINT, signal.SIGTERM):
+    loop.add_signal_handler(s, task.cancel)
+loop.run_until_complete(task)
+```
+
+---
+
+## 6  |  Dockerfile
+
+`apps/orchestrator/Dockerfile`
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY pyproject.toml poetry.lock* /app/
+RUN pip install --no-cache-dir poetry && \
+    poetry export -f requirements.txt --without-hashes | pip install -r /dev/stdin
+COPY apps/orchestrator /app/apps/orchestrator
+CMD ["python", "-m", "apps.orchestrator"]
+```
+
+Add to **`docker-compose.yml`**
+
+```yaml
+  orchestrator:
+    build: ./apps/orchestrator
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+    depends_on: [kafka]
+```
+
+---
+
+## 7  |  Dummy producer script for local smoke test
+
+`scripts/mock_change_request.py`
+
+```python
+from confluent_kafka import Producer
+from apps import core_contracts_pb2 as pb
+import uuid, os
+p = Producer({"bootstrap.servers": os.getenv("BOOT","localhost:9092")})
+cr = pb.ChangeRequest(id=str(uuid.uuid4()), requester="kil",
+                      repo="demo", branch="main",
+                      description="add greet()")
+p.produce("change.request.in", cr.SerializeToString())
+p.flush()
+```
+
+Run services:
+
+```bash
+docker compose up --build orchestrator kafka zookeeper
+python scripts/mock_change_request.py
+```
+
+Orchestrator logs should move to `plan_phase`.
+
+---
+
+## 8  |  Unit test for FSM
+
+`apps/orchestrator/tests/test_fsm.py`
+
+```python
+from apps.orchestrator.state_machine import OrchestratorFSM, Stage
+def test_ok_flow():
+    f = OrchestratorFSM()
+    f.crq(); assert f.state == Stage.PLAN.value
+    f.plan(); assert f.state == Stage.CODE.value
+    f.code_ok()
+    f.build_ok()
+    f.tspec(); f.gt_ok(); f.build2_ok()
+    assert f.state == Stage.DONE.value
+```
+
+Add to CI in `.github/workflows/ci.yml`.
+
+---
+
+## 9  |  Metrics endpoint
+
+`apps/orchestrator/main.py` (add):
+
+```python
+from prometheus_client import Counter, Histogram, start_http_server
+STAGE_METRIC = Counter("orch_stage_total","increment per stage",["stage"])
+start_http_server(9300)
+
+def update_metric():
+    STAGE_METRIC.labels(fsm.state).inc()
+```
+
+Call `update_metric()` each time state changes.
+
+---
+
+## 10  |  Commit & tag
+
+```bash
+git add proto/core_contracts.proto apps/orchestrator docker-compose.yml scripts/mock_change_request.py
+git commit -m "phase03: orchestrator skeleton + core protobuf contracts"
+git push origin main
+git tag phase-03-complete
+git push origin phase-03-complete
+```
+
+---
+
+### Phase 03 complete
+
+*Orchestrator service is up, consumes Kafka topics, drives the FSM, and exposes Prometheus metrics.*
+You’re ready to plug in real agents starting with **Phase 04 – Request-Planner Agent**.

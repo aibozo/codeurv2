@@ -1,0 +1,236 @@
+### Phase 05 — Code-Planner Agent
+
+*Goal: convert each `Plan` proto into a **TaskBundle** of concrete `CodingTask`s enriched with context and SRM look-ups, then push the bundle to Kafka so the Orchestrator can launch Coding-Agents in parallel.*
+
+---
+
+## 0  |  Prerequisites & New Libraries
+
+| Library                          | Why                                            | Install                                 |
+| -------------------------------- | ---------------------------------------------- | --------------------------------------- |
+| `tree-sitter` & `py-tree-sitter` | rapid symbol parsing                           | `poetry add tree-sitter py-tree-sitter` |
+| `networkx` 3.3                   | call-graph DAG                                 | `poetry add networkx`                   |
+| `radon` 6.0                      | cyclomatic complexity                          | `poetry add radon`                      |
+| Existing clients                 | `rag_client`, `srm_client` from earlier phases |                                         |
+
+---
+
+## 1  |  Expand protobuf contracts
+
+Append to **`proto/core_contracts.proto`**
+
+```proto
+message CodingTask {
+  string id          = 1;
+  string parent_plan_id = 2;
+  int32  step_number = 3;
+  string goal        = 4;
+  string path        = 5;
+  string kind        = 6;          // ADD | EDIT | ...
+  repeated string blob_ids  = 7;   // context chunk ids
+  string complexity = 8;           // trivial | moderate | complex
+  string base_commit_sha = 9;      // future use
+}
+
+message TaskBundle {
+  string plan_id      = 1;
+  repeated CodingTask tasks = 2;
+}
+```
+
+Regenerate stubs:
+
+```bash
+python -m grpc_tools.protoc -I proto --python_out=apps proto/core_contracts.proto
+```
+
+---
+
+## 2  |  Topic constant
+
+Add to `apps/orchestrator/topics.py` (already exists but ensure):
+
+```python
+TASK = "code.task.out"
+```
+
+---
+
+## 3  |  Agent implementation
+
+`apps/agents/code_planner/agent.py`
+
+```python
+import uuid, asyncio, os, logging
+from collections import defaultdict
+from confluent_kafka import Producer, Consumer, KafkaError
+from apps.core_contracts_pb2 import Plan, TaskBundle, CodingTask
+from clients.rag_client import RagClient
+from clients.srm_client import SRMClient
+from apps.orchestrator import topics as T
+import networkx as nx, radon.complexity as rc
+
+BOOT = os.getenv("KAFKA_BOOTSTRAP","kafka:9092")
+consumer = Consumer({
+    "bootstrap.servers": BOOT,
+    "group.id": "code-planner",
+    "auto.offset.reset": "earliest"
+})
+consumer.subscribe([T.PLAN])
+producer = Producer({"bootstrap.servers": BOOT})
+
+rag = RagClient("rag_service", 9100)
+srm = SRMClient("srm", 9090)
+log = logging.getLogger("code-planner")
+
+async def complexity_of(snippet:str)->str:
+    try:
+        cc = max(b.complexity for b in rc.cc_visit(snippet))
+        return "trivial" if cc<=5 else "moderate" if cc<=10 else "complex"
+    except Exception:
+        return "moderate"
+
+async def build_tasks(plan:Plan)->TaskBundle:
+    tb = TaskBundle(plan_id=plan.id)
+    for step in plan.steps:
+        task = CodingTask(
+            id=str(uuid.uuid4()),
+            parent_plan_id=plan.id,
+            step_number=step.order,
+            goal=step.goal,
+            path=step.path,
+            kind=step.kind
+        )
+        # hydrate contextual chunks
+        ctx = await rag.hybrid_search(step.goal, k=6, alpha=.25,
+                                      filter={"path": step.path} if step.path else None)
+        task.blob_ids.extend([c.id for c in ctx])
+        # complexity label
+        if ctx:
+            snippet = ctx[0].snippet
+            task.complexity = await complexity_of(snippet)
+        else:
+            task.complexity = "moderate"
+        tb.tasks.append(task)
+    return tb
+
+async def loop():
+    while True:
+        msg = consumer.poll(0.3)
+        if not msg:
+            await asyncio.sleep(0.1); continue
+        if msg.error() and msg.error().code() != KafkaError._PARTITION_EOF:
+            log.error(msg.error()); continue
+        plan = Plan.FromString(msg.value())
+        tb = await build_tasks(plan)
+        producer.produce(T.TASK, tb.SerializeToString())
+        producer.flush()
+        log.info("emitted %d tasks for plan %s", len(tb.tasks), plan.id)
+
+if __name__ == "__main__":
+    asyncio.run(loop())
+```
+
+*(A full call-graph & dependency DAG would parse files; for MVP we emit tasks 1-to-1. Edges can be added later.)*
+
+---
+
+## 4  |  Dockerfile
+
+`apps/agents/code_planner/Dockerfile`
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY pyproject.toml poetry.lock* /app/
+RUN pip install --no-cache-dir poetry && \
+    poetry export -f requirements.txt --without-hashes | pip install -r /dev/stdin
+COPY apps/agents/code_planner /app/apps/agents/code_planner
+COPY clients /app/clients
+CMD ["python", "-m", "apps.agents.code_planner.agent"]
+```
+
+Extend **`docker-compose.yml`**
+
+```yaml
+  code_planner:
+    build: ./apps/agents/code_planner
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+    depends_on: [kafka, orchestrator, rag_service]
+```
+
+---
+
+## 5  |  Unit test (mocked RAG)
+
+`apps/agents/code_planner/tests/test_builder.py`
+
+```python
+import asyncio, json
+from apps.core_contracts_pb2 import Plan, Step
+from apps.agents.code_planner.agent import build_tasks
+
+class Dummy:
+    async def hybrid_search(self,*_,**__):
+        from types import SimpleNamespace
+        return [SimpleNamespace(id=1,snippet="def x(): pass")]
+from apps.agents.code_planner import agent as mod
+mod.rag = Dummy()
+
+async def _run():
+    plan = Plan(id="p1"); plan.steps.append(
+        Step(order=1, goal="add greet()", kind="ADD", path="src/app.py"))
+    tb = await build_tasks(plan)
+    assert tb.tasks[0].complexity in ("trivial","moderate","complex")
+asyncio.run(_run())
+```
+
+Add to CI step.
+
+---
+
+## 6  |  Prometheus metric
+
+In `agent.py`:
+
+```python
+from prometheus_client import Counter, start_http_server
+TASKS = Counter("cp_tasks_emitted_total","coding tasks")
+start_http_server(9500)
+...
+producer.produce(T.TASK, tb.SerializeToString())
+TASKS.inc(len(tb.tasks))
+```
+
+---
+
+## 7  |  Smoke test end-to-end
+
+```bash
+docker compose up --build -d kafka zookeeper postgres \
+   qdrant srm rag_service orchestrator request_planner code_planner
+python scripts/mock_change_request.py
+docker-compose logs -f code_planner | tail
+docker-compose logs -f orchestrator | grep code_phase   # should advance to BUILD1 when later agents appear
+```
+
+You should see “emitted N tasks”.
+
+---
+
+## 8  |  Commit & tag
+
+```bash
+git add proto/core_contracts.proto apps/agents/code_planner docker-compose.yml
+git commit -m "phase05: code-planner agent emits CodingTask bundles"
+git push origin main
+git tag phase-05-complete
+git push origin phase-05-complete
+```
+
+---
+
+### Phase 05 complete
+
+*Code-Planner now listens for `Plan`s, queries RAG for per-step context, labels complexity, packages everything into a `TaskBundle`, and publishes it to `code.task.out`.  The Orchestrator will next spawn Coding-Agent workers from these tasks* — ready for **Phase 06 — Coding-Agent**.

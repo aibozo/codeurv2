@@ -1,0 +1,62 @@
+name: Lint & Unit Test
+on: [push, pull_request]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: abatilo/actions-poetry@v3
+      - run: poetry install
+      - run: poetry run ruff check .
+      - run: poetry run black --check .
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sr
+          POSTGRES_PASSWORD: srpass
+          POSTGRES_DB: symbol_registry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: abatilo/actions-poetry@v3
+      - run: poetry install
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libgit2-dev
+      - run: poetry run pytest apps/symbol_registry/tests -q
+        env:
+          DATABASE_URL: postgresql+asyncpg://sr:srpass@localhost:5432/symbol_registry
+      - run: poetry run pytest apps/git_adapter/tests -q
+      - run: poetry run pytest apps/rag_service/tests -q
+      - run: poetry run pytest clients/rag_client/tests -q
+      - run: poetry run pytest apps/orchestrator/tests -q
+      - run: poetry run pytest clients/llm_client/tests -q
+        env:
+          LLM_BACKEND: dummy
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || 'sk-dummy' }}
+      - run: poetry run pytest apps/agents/request_planner/tests -q
+        env:
+          LLM_BACKEND: dummy
+      - run: poetry run pytest clients/kafka_utils/tests -q
+      - run: poetry run pytest apps/agents/code_planner/tests -q
+      - run: poetry run pytest apps/agents/coding_agent/tests -q
+        env:
+          MOCK_LLM: "1"
+      - run: poetry run pytest apps/git_cache/tests -q
+      - run: poetry run pytest apps/ci_runner/tests -q

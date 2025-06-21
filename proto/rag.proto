@@ -1,0 +1,14 @@
+syntax = "proto3";
+package rag;
+
+message SearchQuery  { string query   = 1; int32 k = 2; float alpha = 3; }
+message DocRef       { string point_id  = 1; string snippet = 2; float score = 3; }
+message SearchReply  { repeated DocRef results = 1; }
+
+message SnippetRequest { string point_id = 1; int32 radius = 2; }
+message SnippetReply   { string text = 1; }
+
+service RagService {
+  rpc HybridSearch(SearchQuery)  returns (SearchReply);
+  rpc Snippet     (SnippetRequest) returns (SnippetReply);
+}

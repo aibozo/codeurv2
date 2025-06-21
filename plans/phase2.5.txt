@@ -1,0 +1,226 @@
+### Phase 2.5 — **`RagClient` Python SDK**
+
+*Goal: ship one tiny, async SDK so every agent hits the RAG micro-service with the exact same helper methods (`hybrid_search()`, `snippet()`, `grep_like()`, `snippet_stream()`, pagination, retries, Prom-metric). You’ll remove all ad-hoc HTTP calls from agents in later phases.*
+
+---
+
+## 0  |  Directory layout
+
+```
+clients/
+└── rag_client/
+    ├── __init__.py
+    ├── _http.py          # REST wrapper
+    ├── _grpc.py          # gRPC wrapper (optional)
+    ├── cache.py          # optional LRU
+    └── typing.py         # TypedDicts for results
+```
+
+---
+
+## 1  |  Dependencies
+
+Add once to **`pyproject.toml`**
+
+```toml
+[tool.poetry.dependencies]
+httpx      = "^0.27"
+aiohttp    = "^3.9"   # only if you want both libs
+tenacity   = "^8.3"   # retry decorator
+pydantic   = "^2.7"
+```
+
+No new runtime images—agents already contain these deps via other phases.
+
+---
+
+## 2  |  `typing.py`
+
+```python
+from typing import TypedDict, List
+
+class DocHit(TypedDict):
+    point_id: int
+    snippet: str
+    score: float
+```
+
+---
+
+## 3  |  `cache.py` – in-mem LRU (optional disk swap)
+
+```python
+import functools, time
+class LRU:
+    def __init__(self, cap=2048):
+        self._cap = cap; self._data = {}
+    def get(self, k):
+        v = self._data.get(k)
+        if v: v[1] = time.time(); return v[0]
+    def set(self, k, v):
+        self._data[k] = [v, time.time()]
+        if len(self._data) > self._cap:
+            old = min(self._data.items(), key=lambda x: x[1][1])[0]
+            del self._data[old]
+CACHE = LRU()
+```
+
+---
+
+## 4  |  `_http.py` – REST implementation (default)
+
+```python
+import os, httpx, tenacity, logging, json
+from .typing import DocHit
+from .cache import CACHE
+from typing import List
+
+BASE = os.getenv("RAG_ENDPOINT", "http://rag_service:8000")
+log  = logging.getLogger("rag-client.http")
+
+@tenacity.retry(
+    wait=tenacity.wait_exponential(multiplier=0.5, min=1, max=8),
+    stop=tenacity.stop_after_attempt(3),
+    reraise=True)
+async def _get(path, params=None):
+    async with httpx.AsyncClient(timeout=30) as cli:
+        r = await cli.get(f"{BASE}{path}", params=params)
+        r.raise_for_status(); return r.json()
+
+async def hybrid_search(query:str, k:int=8, alpha:float=0.25, filter:dict|None=None) -> List[DocHit]:
+    cache_key = f"hs::{query}:{k}:{alpha}:{json.dumps(filter,sort_keys=True)}"
+    if hit:=CACHE.get(cache_key): return hit
+    params = {"q": query, "k": k, "alpha": alpha}
+    if filter: params.update(filter)
+    js = await _get("/search", params=params)
+    CACHE.set(cache_key, js["results"])
+    return js["results"]
+
+async def snippet(point_id:int, radius:int=20)->str:
+    cache_key = f"snip::{point_id}:{radius}"
+    if hit:=CACHE.get(cache_key): return hit
+    js = await _get(f"/snippet/{point_id}", params={"radius": radius})
+    CACHE.set(cache_key, js["text"])
+    return js["text"]
+
+async def grep_like(regex:str, repo:str|None=None, k:int=20):
+    params={"q":regex,"k":k,"alpha":0.0}
+    if repo: params["repo"]=repo
+    return await _get("/search", params=params)
+
+async def snippet_stream(ids:list[int], radius:int=30):
+    for pid in ids:
+        yield await snippet(pid, radius=radius)
+```
+
+*(If you prefer gRPC, replicate same function names in `_grpc.py` using generated stubs, then `__init__.py` chooses based on env var.)*
+
+---
+
+## 5  |  `__init__.py`
+
+```python
+import os
+from .typing import DocHit
+from typing import List
+
+MODE = os.getenv("RAG_CLIENT_TRANSPORT","http")  # http | grpc
+if MODE == "grpc":
+    from ._grpc import hybrid_search, snippet, grep_like, snippet_stream
+else:
+    from ._http import hybrid_search, snippet, grep_like, snippet_stream
+
+__all__ = ["hybrid_search", "snippet", "grep_like", "snippet_stream", "DocHit"]
+```
+
+---
+
+## 6  |  Prometheus metrics
+
+Modify `_http.py`:
+
+```python
+from prometheus_client import Counter
+
+CALLS = Counter("rag_client_calls_total","calls",["method"])
+LAT   = Counter("rag_client_latency_sec","seconds",["method"])
+
+async def _timed(fn, *a, **kw):
+    import time; t=time.perf_counter()
+    res=await fn(*a,**kw); LAT.labels(fn.__name__).inc(time.perf_counter()-t); return res
+
+# wrap public funcs
+async def hybrid_search(...):
+    CALLS.labels("search").inc(); return await _timed(_hybrid_search_impl,...)
+```
+
+(or export via OpenTelemetry spans).
+
+---
+
+## 7  |  Agent migration (example)
+
+### Before (Request-Planner):
+
+```python
+ctx_snips = await rag.hybrid_search(cr.description_md, k=40, alpha=.25)
+```
+
+### After:
+
+```python
+from clients.rag_client import hybrid_search, snippet_stream
+ctx_snips = await hybrid_search(cr.description_md, k=40, alpha=.25)
+```
+
+No other code changes needed; function signatures identical to the stub helpers you were already calling informally.
+
+---
+
+## 8  |  Unit test
+
+`clients/rag_client/tests/test_cache.py`
+
+```python
+import asyncio, pytest
+from clients.rag_client import hybrid_search
+
+@pytest.mark.asyncio
+async def test_hybrid_cache(monkeypatch):
+    calls=0
+    async def fake_get(*_,**__):
+        nonlocal calls; calls+=1
+        return {"results":[{"point_id":1,"snippet":"hi","score":1.0}]}
+    monkeypatch.setattr("clients.rag_client._http._get", fake_get)
+    res1=await hybrid_search("hello",k=2)
+    res2=await hybrid_search("hello",k=2)
+    assert calls==1 and res1==res2
+```
+
+Add to CI.
+
+---
+
+## 9  |  Docker / Compose impact
+
+Nothing to build—`rag_client` is just a library in the same repo. Agents already include its dependencies.
+
+---
+
+## 10  |  Commit & Tag
+
+```bash
+mkdir -p clients/rag_client clients/rag_client/tests
+# add all files above
+git add clients/rag_client
+git commit -m "phase02.5: async RagClient SDK with cache, retries, metrics"
+git push origin main
+git tag phase-02.5-complete
+git push origin phase-02.5-complete
+```
+
+---
+
+### Phase 2.5 complete
+
+*Every agent now has a single import path (`clients.rag_client`) for RAG calls, giving you retries, caching, unified metrics, and transport-agnostic flexibility—no more custom HTTP snippets scattered through the codebase.*

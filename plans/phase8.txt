@@ -1,0 +1,284 @@
+### Phase 08 — Test-Planner & Test-Builder
+
+*Goal: add the two agents that (1) analyse a green build to decide **what tests are missing**, and (2) generate those tests as an LLM-made patch, run them locally, and push a new commit.  When Test-Builder passes its own fast test shard it emits `GeneratedTests`, triggering the second Build/CI pass.*
+
+---
+
+## 0  |  New protobuf messages (recap)
+
+```proto
+message TestSpec {
+  string id                 = 1;
+  string parent_commit_sha  = 2;
+  repeated TestCase cases   = 3;
+  double min_line_coverage  = 4;
+}
+
+message TestCase   { string name = 1; string goal = 2; string target_path = 3; }
+
+message GeneratedTests {
+  string spec_id         = 1;
+  string commit_sha      = 2;
+  string branch_name     = 3;
+  string precheck        = 4;  // PASSED | FAILED
+  repeated string notes  = 5;
+}
+```
+
+(stubs already generated automatically when you regenerate `proto/core_contracts.proto`).
+
+Kafka topics (already defined in Phase-03 file):
+
+```
+test.spec.out      (TSPEC)
+generated.tests.out (GTRES)
+```
+
+Orchestrator already waits on these topics.
+
+---
+
+## 1  |  Dependencies
+
+Add to **`pyproject.toml`**
+
+```toml
+[tool.poetry.dependencies]
+covdefaults = "^2.3"              # quick coverage JSON helper (optional)
+```
+
+### Python LLM packages
+
+The same `openai` package from previous phases is re-used for test generation.
+
+---
+
+## 2  |  Test-Planner Agent
+
+`apps/agents/test_planner/agent.py`
+
+```python
+import os, asyncio, json, uuid, logging
+from confluent_kafka import Consumer, Producer, KafkaError
+from apps.core_contracts_pb2 import BuildReport, TestSpec, TestCase
+from clients.rag_client import RagClient
+from apps.orchestrator import topics as T
+
+BOOT = os.getenv("KAFKA_BOOTSTRAP","kafka:9092")
+consumer = Consumer({"bootstrap.servers":BOOT,"group.id":"test-planner","auto.offset.reset":"earliest"})
+consumer.subscribe([T.BREPORT])
+producer = Producer({"bootstrap.servers":BOOT})
+rag = RagClient("rag_service",9100)
+
+log = logging.getLogger("test-planner")
+MIN_COV = float(os.getenv("MIN_LINE_COV","80.0"))
+
+async def build_testspec(report:BuildReport)->TestSpec:
+    ts = TestSpec(id=str(uuid.uuid4()),
+                  parent_commit_sha=report.commit_sha,
+                  min_line_coverage=MIN_COV)
+    # pick files with low coverage (simple heuristic)
+    low_cov_paths = [row["file"] for row in json.loads(
+        open("coverage.json").read())["files"].values()
+                     if row["summary"]["percent_covered"] < MIN_COV][:5]
+    if not low_cov_paths: low_cov_paths = ["."]
+    for path in low_cov_paths:
+        ctx = await rag.hybrid_search(f"How to test {path}", k=1, alpha=0.3)
+        ts.cases.append(TestCase(
+            name=f"test_{os.path.basename(path).replace('.','_')}",
+            goal=f"Add unit test to cover edge-cases in {path}",
+            target_path=path
+        ))
+    return ts
+
+async def main():
+    while True:
+        msg = consumer.poll(0.3)
+        if not msg: await asyncio.sleep(0.15); continue
+        if msg.error() and msg.error().code()!=KafkaError._PARTITION_EOF:
+            log.error(msg.error()); continue
+        rep = BuildReport.FromString(msg.value())
+        if rep.status!="PASSED": continue          # only green Build-1
+        ts = await build_testspec(rep)
+        producer.produce(T.TSPEC, ts.SerializeToString())
+        producer.flush()
+        log.info("Emitted TestSpec %s with %d cases", ts.id, len(ts.cases))
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+*For MVP we simply look for coverage holes; later you can parse the JSON produced by coverage to pinpoint exact functions.*
+
+---
+
+## 3  |  Test-Builder Agent
+
+`apps/agents/test_builder/agent.py`
+
+```python
+import os, asyncio, json, uuid, tempfile, subprocess, tarfile, logging, shutil
+from pathlib import Path
+from confluent_kafka import Consumer, Producer, KafkaError
+from apps.core_contracts_pb2 import TestSpec, GeneratedTests
+from clients.rag_client import RagClient
+import openai, unidiff, git
+from apps.orchestrator import topics as T
+
+BOOT=os.getenv("KAFKA_BOOTSTRAP","kafka:9092")
+REMOTE_REPO=os.getenv("REMOTE_REPO")
+rag = RagClient("rag_service",9100)
+consumer=Consumer({"bootstrap.servers":BOOT,"group.id":"test-builder","auto.offset.reset":"earliest"})
+consumer.subscribe([T.TSPEC])
+producer=Producer({"bootstrap.servers":BOOT})
+log=logging.getLogger("test-builder")
+LLM_MODEL=os.getenv("TEST_MODEL","gpt-4o-mini-code-30k")
+
+async def llm_tests(spec:TestSpec, ctx:str)->str:
+    system="Return UNIFIED DIFF that adds pytest tests ONLY under tests/."
+    user=f"""Parent commit: {spec.parent_commit_sha}
+Required cases:
+{json.dumps([{"name":c.name,"goal":c.goal} for c in spec.cases],indent=2)}
+Context:
+{ctx[:3000]}"""
+    r=await openai.ChatCompletion.acreate(
+        model=LLM_MODEL,temperature=0.15,
+        messages=[{"role":"system","content":system},{"role":"user","content":user}],
+        response_format={"type":"text"})          # diff as plain text
+    return r.choices[0].message.content
+
+def apply(repo:git.Repo,diff:str)->bool:
+    try: unidiff.PatchSet(diff); repo.git.apply("--whitespace=nowarn",with_stdout=True,input=diff)
+    except Exception as e: log.warning("patch fail %s",e); return False
+    return True
+
+def selfcheck(repo_dir)->tuple[bool,list]:
+    notes=[]
+    r=subprocess.run(["pytest","-q","-m","fast"],cwd=repo_dir,capture_output=True,text=True)
+    if r.returncode: notes.append(r.stdout+r.stderr)
+    return r.returncode==0, notes
+
+async def process(spec:TestSpec):
+    wd=Path(tempfile.mkdtemp())
+    repo=git.Repo.clone_from(REMOTE_REPO, wd, depth=1, branch="main")
+    repo.git.checkout(spec.parent_commit_sha, b=f"tb/{spec.id[:8]}")
+    ctx="\n".join(await rag.get_snippets([c.target_path for c in spec.cases]))
+    diff=await llm_tests(spec,ctx)
+    if not apply(repo,diff):
+        status="FAILED"; pre="FAILED"; notes=["patch rejected"]
+    else:
+        ok, notes=selfcheck(repo.working_dir)
+        pre="PASSED" if ok else "FAILED"
+        status="SUCCESS" if ok else "FAILED"
+        if ok:
+            repo.git.add("tests")
+            repo.git.commit("-m",f"tests: {spec.id}")
+            repo.git.push("origin",repo.active_branch.name)
+    g=GeneratedTests(spec_id=spec.id,commit_sha=repo.head.commit.hexsha if pre=="PASSED" else "",
+                     branch_name=repo.active_branch.name,precheck=pre,notes=notes)
+    producer.produce(T.GTRES,g.SerializeToString()); producer.flush()
+    shutil.rmtree(wd)
+
+async def main():
+    while True:
+        m=consumer.poll(0.3)
+        if not m: await asyncio.sleep(0.1); continue
+        if m.error() and m.error().code()!=KafkaError._PARTITION_EOF:
+            log.error(m.error()); continue
+        spec=TestSpec.FromString(m.value())
+        await process(spec)
+
+if __name__=="__main__":
+    asyncio.run(main())
+```
+
+*(`rag.get_snippets()` is a helper you can add to your `RagClient` that returns the text for blob IDs or paths.)*
+
+---
+
+## 4  |  Dockerfiles & Compose
+
+`apps/agents/test_planner/Dockerfile` & `apps/agents/test_builder/Dockerfile`
+
+* mirror earlier agents, install pytest group, copy clients.
+
+Add to **`docker-compose.yml`**
+
+```yaml
+  test_planner:
+    build: ./apps/agents/test_planner
+    environment: {KAFKA_BOOTSTRAP: kafka:9092}
+    depends_on: [kafka, rag_service, orchestrator]
+
+  test_builder:
+    build: ./apps/agents/test_builder
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      REMOTE_REPO: "https://github.com/your-org/self-healing-code"
+      OPENAI_API_KEY: "sk-dummy"
+    depends_on: [kafka, rag_service, orchestrator]
+    deploy: {replicas: 2}
+```
+
+---
+
+## 5  |  Unit Tests (mocked)
+
+`apps/agents/test_builder/tests/test_diff_parse.py`
+
+```python
+import unidiff
+def test_valid():
+    diff="--- a/x\n+++ b/x\n@@\n+print('hi')\n"
+    ps=unidiff.PatchSet(diff)
+    assert len(ps) == 1
+```
+
+Add to CI.
+
+---
+
+## 6  |  Prometheus Metrics
+
+Add counters inside each agent:
+
+```python
+from prometheus_client import Counter, start_http_server
+TSPEC_CNT = Counter("tp_specs_total","specs")
+TB_GEN    = Counter("tb_tests_total","generated",["result"])
+start_http_server(9800)   # choose distinct port per agent
+```
+
+Call `TB_GEN.labels(pre).inc()` after emit.
+
+---
+
+## 7  |  Smoke Test
+
+```bash
+docker compose up --build -d kafka zookeeper postgres qdrant \
+   srm rag_service orchestrator request_planner code_planner \
+   coding_agent ci_runner test_planner test_builder
+python scripts/mock_change_request.py
+docker-compose logs -f orchestrator | grep build2_ok
+```
+
+Flow should reach **Build-2** after Test-Builder passes; Orchestrator transitions to `DONE`.
+
+---
+
+## 8  |  Commit & Tag
+
+```bash
+git add apps/agents/test_planner apps/agents/test_builder docker-compose.yml
+git commit -m "phase08: test planner & builder agents; full fast-test loop"
+git push origin main
+git tag phase-08-complete
+git push origin phase-08-complete
+```
+
+---
+
+### Phase 08 complete
+
+*Green Build-1 now triggers Test-Planner, which emits structured `TestSpec`s; Test-Builder writes pytest code, self-verifies, pushes a new commit, and signals the Orchestrator.  The second Build/CI pass runs and, when green, the Orchestrator marks the change request **DONE**.  Your self-healing loop is now end-to-end functional.*

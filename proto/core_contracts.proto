@@ -1,0 +1,63 @@
+syntax = "proto3";
+package core;
+
+message ChangeRequest {
+  string id          = 1;
+  string requester   = 2;
+  string repo        = 3;
+  string branch      = 4;
+  string description = 5;
+}
+
+message Step {
+  int32  order   = 1;
+  string goal    = 2;
+  string kind    = 3;          // ADD | EDIT | REMOVE | REFACTOR
+  string path    = 4;          // file to touch
+}
+
+message Plan {
+  string id              = 1;
+  string parent_request_id = 2;
+  repeated Step steps     = 3;
+  repeated string rationale = 4;
+  repeated string reserved_lease_ids = 5;
+}
+
+message CodingTask {
+  string id          = 1;
+  string parent_plan_id = 2;
+  int32  step_number = 3;
+  string goal        = 4;
+  string path        = 5;
+  string kind        = 6;          // ADD | EDIT | ...
+  repeated string blob_ids  = 7;   // context chunk ids
+  string complexity = 8;           // trivial | moderate | complex
+  string base_commit_sha = 9;      // future use
+}
+
+message TaskBundle {
+  string plan_id      = 1;
+  repeated CodingTask tasks = 2;
+}
+message CommitResult {
+  string task_id     = 1;
+  string commit_sha  = 2;
+  string status      = 3;   // SUCCESS | SOFT_FAIL | HARD_FAIL
+  string branch_name = 4;
+  repeated string notes = 5;
+}
+message BuildReport {
+  string commit_sha  = 1;
+  string status      = 2;   // PASSED | FAILED | ERRORED
+  repeated string failed_tests = 3;
+  repeated string lint_errors  = 4;
+  double line_coverage         = 5;
+  string artefact_url          = 6;
+}
+message TestSpec       { string id = 1; string parent_commit_sha = 2; }
+message GeneratedTests { string spec_id = 1; string commit_sha = 2; string precheck = 3; }
+message RegressionTicket { string id = 1; string summary = 2; }
+
+message DeepPlan { string id = 1; repeated Phase phases = 2; }
+message Phase    { string id = 1; string goal = 2; }
