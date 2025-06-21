@@ -1,0 +1,45 @@
+# ── Dependencies stage
+FROM images/python-poetry-base:3.11 AS deps
+WORKDIR /app
+
+# Additional system dependencies
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update && apt-get install -y libgit2-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy dependency files
+COPY pyproject.toml poetry.lock ./
+
+# Install dependencies with cache mount and prefer binary packages
+RUN --mount=type=cache,target=/root/.cache/pip \
+    poetry install --no-root --only main --no-interaction --no-ansi --prefer-wheels && \
+    rm -rf /tmp/poetry_cache
+
+# ── Runtime stage
+FROM images/python-poetry-base:3.11 AS runtime
+WORKDIR /app
+
+# Install runtime system dependencies
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update && apt-get install -y libgit2-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy installed dependencies from deps stage
+COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=deps /usr/local/bin /usr/local/bin
+
+# Copy protobuf generated files
+COPY apps/*_pb2*.py /app/apps/
+COPY apps/__init__.py /app/apps/
+
+# Copy proto definitions and create proto directory with pb2 files
+COPY proto /app/proto
+RUN mkdir -p /app/proto && cp /app/apps/*_pb2*.py /app/proto/
+
+# Copy app specific files
+COPY apps/git_adapter /app/apps/git_adapter
+
+ENV PYTHONPATH=/app
+
+EXPOSE 8200 8300
+CMD ["python", "-m", "apps.git_adapter.startup"]

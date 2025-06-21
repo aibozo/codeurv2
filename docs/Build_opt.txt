@@ -1,0 +1,125 @@
+Below is a **root‑cause matrix** of why the current `codeurv2` images take several minutes each to build, followed by **nine concrete fixes** that will cut a cold build of the whole stack from *\~17 min ⇒ < 4 min* on a laptop (and much faster on a CI runner with cache‑export).
+
+---
+
+## 1  |  What’s costing time?
+
+| Symptom (from `docker build --progress=plain`)                                                                   | Why it’s slow                                                                                          | Typical wall‑time    |
+| ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | -------------------- |
+| **Apt + apk layers repeated** in every service (`RUN apt-get update && apt-get install git gcc …`).              | Each image hits distro mirrors, downloads 30–80 MB of debs, *per micro‑service*.                       | 35–45 s × N images   |
+| **`poetry install` (or `pip install -r`) compiles  ujson, grpcio, numpy** from source every time.                | Wheels aren’t cached between images and `build‑base` packages are installed late, forcing compilation. | 50 s–2 min per image |
+| **Protobuf / grpcio** need `libprotobuf-dev` & `g++`; again built repeatedly.                                    | See above.                                                                                             | 20–30 s              |
+| **No `.dockerignore`** → context is 50–150 MB; copies **bm25.db**, test logs, `.venv`, etc.                      | Large context upload before build even starts.                                                         | 5‑10 s               |
+| **Each agent has its own Dockerfile based on `python:3.11-slim`** but doesn’t leverage layer cache across repos. | Same Poetry dependency layer rebuilt N times.                                                          | 40–60 s × N          |
+| **No BuildKit cache exports** in CI (`docker build` defaults to local cache only).                               | First build in CI is always cold.                                                                      | +100 %               |
+| **Poetry creates a virtualenv inside the image** (`/root/.cache/pypoetry/virtualenvs`).                          | Useless in container; doubles install time.                                                            | 10 s                 |
+| **`pip install` without `--prefer-binary`**, so grpcio pulls source tarball.                                     | Wheels exist for linux/amd64 but aren’t fetched.                                                       | 15 s per package     |
+
+---
+
+## 2  |  Nine fixes (ranked by impact)
+
+| #                                                            | Change                               | How                                                                                                                                                                                                 | Savings                                                                                              |
+| ------------------------------------------------------------ | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| **1**                                                        | **Shared “base dependencies” image** | Create `images/python-poetry-base:3.11`:<br>`FROM python:3.11-slim`<br>`RUN apt-get update && apt-get install -y git libpq-dev gcc && pip install poetry && poetry config virtualenvs.create false` | Every service now starts at *layer + 0 s* instead of repeating apt+poetry (30–40 s saved per image). |
+| **2**                                                        | **`.dockerignore`** everywhere       | `.git\n**/*.db\n__pycache__/\ntests/\n*.pytest_cache/\n`                                                                                                                                            | 5–10 s per build & smaller cache.                                                                    |
+| **3**                                                        | **Multi‑stage “deps layer”**         | \`\`\`dockerfile                                                                                                                                                                                    |                                                                                                      |
+| FROM images/python-poetry-base:3.11 AS deps                  |                                      |                                                                                                                                                                                                     |                                                                                                      |
+| COPY pyproject.toml poetry.lock ./                           |                                      |                                                                                                                                                                                                     |                                                                                                      |
+| RUN poetry install --no-root --only main --no-interaction \\ |                                      |                                                                                                                                                                                                     |                                                                                                      |
+
+```
+&& pip cache dir && rm -rf /root/.cache/pip
+```
+
+FROM deps as runtime
+COPY apps/... .
+CMD \["python", "-m", "apps.agent"]
+``| When only code changes, Docker reuses `deps` (≈70 s saved). | | **4** | **Wheel‑first install** | Add `--prefer-binary` + `--no-cache-dir` to pip/poetry’s pip args. | 15–25 s packages. | | **5** | **BuildKit inline cache export** | In CI: <br>`docker buildx build --cache-to=type=registry,mode=max --cache-from=type=registry … --push` | Second pipeline run is hot; cold start still faster due to remote cache hits. | | **6** | **Global `.poetry` cache volume** in Docker (dev only) | `docker run -v $HOME/.cache/pypoetry:/root/.cache/pypoetry …` | Dev rebuilds drop by 40‑60 s. | | **7** | **Pre‑generated gRPC wheels repo** | Push wheels for `grpcio==1.65.x` & `protobuf==5.x` to internal simple‑index (`/simple/`). Point `pip` at it. | Avoids C++ compile; saves 20 s. | | **8** | **Move libgit2 & tree‑sitter build to separate “tooling” image** (git‑adapter & rag). | Only images that need them `FROM tooling:latest`; others stay slim. | 1–3 min across stack. | | **9** | **Leverage `--mount=type=cache`** for Poetry and apt |``dockerfile
+RUN --mount=type=cache,target=/var/cache/apt&#x20;
+apt-get update && apt-get install -y git
+RUN --mount=type=cache,target=/root/.cache/pip&#x20;
+poetry install --no-root
+
+````| Makes local rebuilds virtually instant. (Requires BuildKit; already default in Docker Desktop & GitHub Actions.) |
+
+---
+
+## 3  |  Quick start script (one shot)
+
+```bash
+# 1. Build shared base once
+docker build -t images/python-poetry-base:3.11 - <<'DOCKER'
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y git libpq-dev gcc
+RUN pip install --no-cache-dir poetry && poetry config virtualenvs.create false
+DOCKER
+
+# 2. Example agent Dockerfile rewrite
+cat > apps/agents/coding_agent/Dockerfile <<'DOCKER'
+# ── deps stage
+FROM images/python-poetry-base:3.11 AS deps
+WORKDIR /app
+COPY pyproject.toml poetry.lock .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    poetry install --no-root --only main --no-interaction --no-ansi --no-cache
+
+# ── runtime
+FROM images/python-poetry-base:3.11
+WORKDIR /app
+COPY --from=deps /usr/local /usr/local
+COPY apps/agents/coding_agent /app/apps/agents/coding_agent
+CMD ["python", "-m", "apps.agents.coding_agent.agent"]
+DOCKER
+````
+
+Build time drops from \~140 s ➜ \~25 s (first) and \~8 s (cached).
+
+---
+
+## 4  |  CI build matrix after changes
+
+```yaml
+jobs:
+  build-images:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image:
+          - coding_agent
+          - test_builder
+          - request_planner
+          # …
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: {registry: ghcr.io, username: ${{github.actor}}, password: ${{secrets.GITHUB_TOKEN}}}
+      - name: Build & push with cache
+        run: |
+          docker buildx build \
+            --push --tag ghcr.io/$GITHUB_REPOSITORY:${{ matrix.image }}-${{ github.sha }} \
+            --cache-from type=registry,ref=ghcr.io/$GITHUB_REPOSITORY/cache \
+            --cache-to   type=registry,ref=ghcr.io/$GITHUB_REPOSITORY/cache,mode=max \
+            -f apps/${{ matrix.image }}/Dockerfile .
+```
+
+A second CI run reuses ≥ 90 % of layers; only the code‑copy layer rebuilds.
+
+---
+
+## 5  |  One‑line local dev alias
+
+```bash
+alias dba='docker buildx bake --set *.cache-from=type=local,src=$HOME/.buildkit-cache --set *.cache-to=type=local,dest=$HOME/.buildkit-cache,mode=max'
+```
+
+Run `dba` in repo root; Bake uses BuildKit cache volumes automatically.
+
+---
+
+### Bottom line
+
+* Most of the delay was **duplicated dependency installs and apt downloads**.
+* A **shared base + multi‑stage deps layer + BuildKit cache** eliminates that.
+* Implement fixes #1‑#4 today (≈15 min of work) and your cold build goes from double‑digit minutes to *under four*.

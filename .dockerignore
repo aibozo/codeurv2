@@ -1,0 +1,61 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.coverage
+.hypothesis/
+*.cover
+*.log
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Tests (exclude from production builds)
+**/tests/
+**/test_*.py
+pytest.ini
+
+# Documentation
+*.md
+docs/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Cache
+.cache/
+.llm_cache/
+pip-cache/
+
+# Docker volumes
+artefacts/
+git-cache/
+
+# Temporary files
+*.tmp
+*.bak
+*~

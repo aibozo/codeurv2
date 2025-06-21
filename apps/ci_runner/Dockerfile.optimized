@@ -1,0 +1,47 @@
+# ── Dependencies stage
+FROM images/python-poetry-base:3.11 AS deps
+WORKDIR /app
+
+# Install system dependencies for CI tools
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update && apt-get install -y git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy dependency files
+COPY pyproject.toml poetry.lock ./
+
+# Install dependencies with CI group
+RUN --mount=type=cache,target=/root/.cache/pip \
+    poetry install --no-root --with ci --no-interaction --no-ansi --prefer-wheels && \
+    rm -rf /tmp/poetry_cache
+
+# ── Runtime stage
+FROM python:3.11 AS runtime
+WORKDIR /app
+
+# Install git for CI operations
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+
+# Copy installed dependencies from deps stage
+COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=deps /usr/local/bin /usr/local/bin
+
+# Copy protobuf definitions and generated code
+COPY proto /app/proto
+COPY apps/*_pb2*.py /app/apps/
+COPY apps/__init__.py /app/apps/
+
+# Copy orchestrator topics
+COPY apps/orchestrator/__init__.py /app/apps/orchestrator/__init__.py
+COPY apps/orchestrator/topics.py /app/apps/orchestrator/topics.py
+
+# Copy ci_runner app
+COPY apps/ci_runner /app/apps/ci_runner
+
+# Create directories
+RUN mkdir -p /artefacts /pipcache
+
+ENV PYTEST_ADDOPTS="-q"
+ENV PYTHONPATH=/app
+
+CMD ["python", "-m", "apps.ci_runner.run"]

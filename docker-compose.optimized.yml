@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  # Build the base image first
+  python-poetry-base:
+    build:
+      context: .
+      dockerfile: ./images/python-poetry-base/Dockerfile
+    image: images/python-poetry-base:3.11
+    command: echo "Base image built"
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: ./apps/orchestrator/Dockerfile.optimized
+    depends_on:
+      - python-poetry-base
+
+  srm:
+    build:
+      context: .
+      dockerfile: ./apps/symbol_registry/Dockerfile.optimized
+    depends_on:
+      - python-poetry-base
+
+  rag_service:
+    build:
+      context: .
+      dockerfile: ./apps/rag_service/Dockerfile.optimized
+    depends_on:
+      - python-poetry-base
+
+  git_adapter:
+    build:
+      context: .
+      dockerfile: ./apps/git_adapter/Dockerfile.optimized
+    depends_on:
+      - python-poetry-base
+
+  request_planner:
+    build:
+      context: .
+      dockerfile: ./apps/agents/request_planner/Dockerfile.optimized
+    depends_on:
+      - python-poetry-base
+
+  code_planner:
+    build:
+      context: .
+      dockerfile: ./apps/agents/code_planner/Dockerfile.optimized
+    depends_on:
+      - python-poetry-base
+
+  coding_agent:
+    build:
+      context: .
+      dockerfile: ./apps/agents/coding_agent/Dockerfile.optimized
+    depends_on:
+      - python-poetry-base
+
+  ci_runner:
+    build:
+      context: .
+      dockerfile: ./apps/ci_runner/Dockerfile.optimized
+    depends_on:
+      - python-poetry-base
+
+# Add cache volume for development
+volumes:
+  poetry-cache:
+    driver: local

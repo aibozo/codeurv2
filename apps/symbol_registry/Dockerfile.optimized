@@ -1,0 +1,35 @@
+# ── Dependencies stage
+FROM images/python-poetry-base:3.11 AS deps
+WORKDIR /app
+
+# Copy dependency files
+COPY pyproject.toml poetry.lock ./
+
+# Install dependencies with cache mount and prefer binary packages
+RUN --mount=type=cache,target=/root/.cache/pip \
+    poetry install --no-root --only main --no-interaction --no-ansi --prefer-wheels && \
+    rm -rf /tmp/poetry_cache
+
+# ── Runtime stage
+FROM images/python-poetry-base:3.11 AS runtime
+WORKDIR /app
+
+# Copy installed dependencies from deps stage
+COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=deps /usr/local/bin /usr/local/bin
+
+# Copy protobuf generated files
+COPY apps/*_pb2*.py /app/apps/
+COPY apps/__init__.py /app/apps/
+
+# Copy proto definitions and create proto directory with pb2 files
+COPY proto /app/proto
+RUN mkdir -p /app/proto && cp /app/apps/*_pb2*.py /app/proto/
+
+# Copy app specific files
+COPY apps/symbol_registry /app/apps/symbol_registry
+
+ENV PYTHONPATH=/app
+
+EXPOSE 8080 9090
+CMD ["python", "-m", "apps.symbol_registry.main"]
