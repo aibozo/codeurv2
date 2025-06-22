@@ -14,7 +14,9 @@ async_session = asynccontextmanager(lambda: AsyncSession(engine))
 async def reserve(data):
     async with async_session() as session:
         expire = datetime.utcnow() + timedelta(seconds=data.ttl_sec)
-        sym = Symbol(**data.model_dump(), reserved_until=expire)
+        # Exclude ttl_sec from the model dump since Symbol doesn't have this field
+        payload = data.model_dump(exclude={'ttl_sec'})
+        sym = Symbol(**payload, reserved_until=expire)
         session.add(sym)
         try:
             await session.commit()
