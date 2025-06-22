@@ -6,7 +6,7 @@ from .models import Symbol, SQLModel
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from os import getenv
-DATABASE_URL = getenv("DATABASE_URL", "postgresql+asyncpg://sr:srpass@localhost:5432/symbol_registry")
+DATABASE_URL = getenv("DATABASE_URL", "postgresql+asyncpg://sr:srpass@localhost:5433/symbol_registry")
 
 engine = create_async_engine(DATABASE_URL, isolation_level="SERIALIZABLE")
 async_session = asynccontextmanager(lambda: AsyncSession(engine))
